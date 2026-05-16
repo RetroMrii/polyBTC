@@ -61,6 +61,20 @@ class BTC5MHybridStrategy:
 
         return max(0.01, min(0.99, prob))
 
+    @staticmethod
+    def _skip(reason: str) -> BTC5MDecision:
+        return BTC5MDecision(
+            action="SKIP",
+            outcome=None,
+            side=None,
+            price=None,
+            size=0.0,
+            model_probability=None,
+            market_probability=None,
+            edge=None,
+            reason=reason,
+        )
+
     def decide(
         self,
         btc_price: float,
@@ -73,40 +87,39 @@ class BTC5MHybridStrategy:
         momentum_60s: float = 0.0,
         volatility_60s: float = 0.0,
     ) -> BTC5MDecision:
-
         if seconds_to_expiry <= self.no_trade_last_seconds:
-            return BTC5MDecision("SKIP", None, None, None, 0, None, None, None, "too_close_to_expiry")
+            return self._skip("too_close_to_expiry")
 
         if seconds_to_expiry < self.min_seconds_to_expiry:
-            return BTC5MDecision("SKIP", None, None, None, 0, None, None, None, "below_min_seconds_to_expiry")
-        
+            return self._skip("below_min_seconds_to_expiry")
+
         if seconds_to_expiry > self.max_seconds_to_expiry:
-            return BTC5MDecision("SKIP", None, None, None, 0, None, None, None, "too_early_in_market")
+            return self._skip("too_early_in_market")
 
         if yes_bid is None or yes_ask is None:
-            return BTC5MDecision("SKIP", None, None, None, 0, None, None, None, "missing_yes_book")
-        
-        distance_from_strike = (btc_price - strike) / strike if strike > 0 else 0.0
+            return self._skip("missing_yes_book")
 
+        if no_bid is None or no_ask is None:
+            return self._skip("missing_no_book")
+
+        distance_from_strike = (btc_price - strike) / strike if strike > 0 else 0.0
         if abs(distance_from_strike) < self.min_distance_from_strike:
-            return BTC5MDecision(
-                "SKIP", None, None, None, 0, None, None, None, "too_close_to_strike"
-            )
+            return self._skip("too_close_to_strike")
 
         if self.require_momentum_confirmation:
             if btc_price > strike and momentum_60s <= 0:
-                return BTC5MDecision(
-                    "SKIP", None, None, None, 0, None, None, None, "yes_momentum_not_confirmed"
-                )
+                return self._skip("yes_momentum_not_confirmed")
 
             if btc_price < strike and momentum_60s >= 0:
-                return BTC5MDecision(
-                    "SKIP", None, None, None, 0, None, None, None, "no_momentum_not_confirmed"
-                )
+                return self._skip("no_momentum_not_confirmed")
 
-        spread = yes_ask - yes_bid
-        if spread > self.max_spread:
-            return BTC5MDecision("SKIP", None, None, None, 0, None, None, None, "spread_too_wide")
+        yes_spread = yes_ask - yes_bid
+        if yes_spread > self.max_spread:
+            return self._skip("yes_spread_too_wide")
+
+        no_spread = no_ask - no_bid
+        if no_spread > self.max_spread:
+            return self._skip("no_spread_too_wide")
 
         model_prob = self.estimate_probability(
             btc_price=btc_price,
@@ -115,43 +128,14 @@ class BTC5MHybridStrategy:
             momentum_60s=momentum_60s,
             volatility_60s=volatility_60s,
         )
-        
-        # Directional sanity filter for first proof-of-edge phase.
-        # Avoid contrarian trades until the model has proven itself.
-        if btc_price < strike and model_prob > 0.5:
-            return BTC5MDecision(
-                action="SKIP",
-                outcome=None,
-                side=None,
-                price=None,
-                size=0,
-                model_probability=model_prob,
-                market_probability=yes_ask,
-                edge=None,
-                reason="blocked_contrarian_yes",
-            )
 
-        if btc_price > strike and model_prob < 0.5:
-            return BTC5MDecision(
-                action="SKIP",
-                outcome=None,
-                side=None,
-                price=None,
-                size=0,
-                model_probability=model_prob,
-                market_probability=yes_ask,
-                edge=None,
-                reason="blocked_contrarian_no",
-            )
         yes_market_prob = yes_ask
         yes_edge = model_prob - yes_market_prob
 
-        no_market_prob = no_ask if no_ask is not None else 1 - yes_bid
         no_model_prob = 1 - model_prob
+        no_market_prob = no_ask
         no_edge = no_model_prob - no_market_prob
 
-        # Proof-of-edge safety filter:
-        # Trade only with the current side of the strike.
         if btc_price > strike:
             if yes_edge >= self.min_edge:
                 return BTC5MDecision(
@@ -171,7 +155,7 @@ class BTC5MHybridStrategy:
                 outcome=None,
                 side=None,
                 price=None,
-                size=0,
+                size=0.0,
                 model_probability=model_prob,
                 market_probability=yes_market_prob,
                 edge=yes_edge,
@@ -179,7 +163,7 @@ class BTC5MHybridStrategy:
             )
 
         if btc_price < strike:
-            if no_ask is not None and no_edge >= self.min_edge:
+            if no_edge >= self.min_edge:
                 return BTC5MDecision(
                     action="BUY",
                     outcome="NO",
@@ -197,7 +181,7 @@ class BTC5MHybridStrategy:
                 outcome=None,
                 side=None,
                 price=None,
-                size=0,
+                size=0.0,
                 model_probability=no_model_prob,
                 market_probability=no_market_prob,
                 edge=no_edge,
@@ -209,7 +193,7 @@ class BTC5MHybridStrategy:
             outcome=None,
             side=None,
             price=None,
-            size=0,
+            size=0.0,
             model_probability=model_prob,
             market_probability=yes_market_prob,
             edge=0.0,
