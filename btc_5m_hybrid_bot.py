@@ -31,22 +31,34 @@ DECISIONS_FILE = "btc_5m_decisions.csv"
 TRADES_FILE = "btc_5m_trades.csv"
 
 
+class LiveOrderUnfilledCancelled(RuntimeError):
+    """Order was posted, did not fill, cancel was confirmed, and post-cancel checks found no position."""
+
+
+class LiveOrderPreCheckBlocked(RuntimeError):
+    """Order was blocked before posting to the CLOB. No live order was sent."""
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
 def load_state() -> dict[str, Any]:
     if not os.path.exists(STATE_FILE):
-        return {
+        state: dict[str, Any] = {
             "mode": "paper",
             "open_positions": {},
             "closed_markets": {},
             "live_failed_orders": {},
+            "live_blocked_orders": {},
+            "live_unfilled_cancelled_orders": {},
+            "live_reconciliation": {},
             "daily_pnl": 0.0,
             "total_pnl": 0.0,
             "last_market_id": None,
             "last_updated": None,
         }
+        return state
 
     with open(STATE_FILE, "r", encoding="utf-8") as f:
         state = json.load(f)
@@ -54,8 +66,13 @@ def load_state() -> dict[str, Any]:
     state.setdefault("open_positions", {})
     state.setdefault("closed_markets", {})
     state.setdefault("live_failed_orders", {})
+    state.setdefault("live_blocked_orders", {})
+    state.setdefault("live_unfilled_cancelled_orders", {})
+    state.setdefault("live_reconciliation", {})
     state.setdefault("daily_pnl", 0.0)
     state.setdefault("total_pnl", 0.0)
+    state.setdefault("last_market_id", None)
+    state.setdefault("last_updated", None)
     return state
 
 
@@ -63,6 +80,23 @@ def save_state(state: dict[str, Any]) -> None:
     state["last_updated"] = utc_now()
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
+
+
+def ensure_csv_headers() -> None:
+    if not os.path.exists(DECISIONS_FILE) or os.path.getsize(DECISIONS_FILE) == 0:
+        with open(DECISIONS_FILE, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([
+                "timestamp", "market_id", "question", "btc_price", "strike",
+                "seconds_to_expiry", "yes_bid", "yes_ask", "no_bid", "no_ask",
+                "model_probability", "market_probability", "edge", "action", "reason",
+            ])
+
+    if not os.path.exists(TRADES_FILE) or os.path.getsize(TRADES_FILE) == 0:
+        with open(TRADES_FILE, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([
+                "timestamp", "mode", "market_id", "side", "outcome", "price",
+                "size", "simulated", "reason", "pnl",
+            ])
 
 
 def log_decision(row: list[Any]) -> None:
@@ -73,6 +107,61 @@ def log_decision(row: list[Any]) -> None:
 def log_trade(row: list[Any]) -> None:
     with open(TRADES_FILE, "a", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow(row)
+
+
+def print_startup_config() -> None:
+    keys = [
+        "BTC_5M_MODE",
+        "BTC_5M_LIVE_ARMED",
+        "BTC_5M_ALLOW_REAL_ORDERS",
+        "BTC_5M_LOOP_SECONDS",
+        "BTC_5M_MIN_EDGE",
+        "BTC_5M_MAX_SPREAD",
+        "BTC_5M_MIN_DISTANCE_FROM_STRIKE",
+        "BTC_5M_MIN_SECONDS_TO_EXPIRY",
+        "BTC_5M_NO_TRADE_LAST_SECONDS",
+        "BTC_5M_MAX_SECONDS_TO_EXPIRY",
+        "BTC_5M_MIN_LIVE_SHARE_SIZE",
+        "BTC_5M_MIN_LIVE_ORDER_VALUE",
+        "BTC_5M_MAX_LIVE_ORDER_VALUE",
+        "BTC_5M_MAX_DAILY_LIVE_LOSS",
+        "BTC_5M_ENTRY_SLIPPAGE",
+        "BTC_5M_ENTRY_ORDER_TIMEOUT_SECONDS",
+        "BTC_5M_EXIT_ORDER_TIMEOUT_SECONDS",
+        "BTC_5M_CASHOUT_EXIT_SLIPPAGE",
+        "BTC_5M_TRAIL_EXIT_SLIPPAGE",
+        "BTC_5M_STOPLOSS_EXIT_SLIPPAGE",
+        "BTC_5M_MIN_NET_PROFIT",
+        "BTC_5M_MAX_NET_LOSS",
+        "BTC_5M_FORCE_EXIT_SECONDS",
+        "BTC_5M_FORCE_EXIT_MIN_NET",
+        "BTC_5M_ENABLE_TRAILING_PROFIT",
+        "BTC_5M_TRAIL_ACTIVATE_NET",
+        "BTC_5M_TRAIL_DROP",
+        "BTC_5M_TRAIL_MIN_SECONDS_TO_EXPIRY",
+        "BTC_5M_TRAIL_FORCE_CASHOUT_NET",
+        "BTC_5M_HARD_MAX_NET_LOSS",
+        "BTC_5M_LATE_DISTANCE_SECONDS",
+        "BTC_5M_LATE_MIN_DISTANCE_FROM_STRIKE",
+        "BTC_5M_STRONG_THESIS_HOLD_SECONDS",
+        "BTC_5M_STRONG_THESIS_MIN_NET",
+        "BTC_5M_STRONG_THESIS_MIN_DISTANCE",
+        "BTC_5M_FORCE_EXIT_FLAT_NET",
+        "BTC_5M_ENABLE_PROFIT_PROTECTION",
+        "BTC_5M_PROFIT_PROTECT_ARM_NET",
+        "BTC_5M_PROFIT_PROTECT_EXIT_NET",
+        "BTC_5M_PROFIT_PROTECT_MIN_SECONDS",
+        "BTC_5M_PROFIT_PROTECT_THESIS_FLIP_EXIT",
+        "BTC_5M_PROFIT_PROTECT_MAX_EXIT_LOSS",
+        "BTC_5M_PROTECT_EXIT_SLIPPAGE",
+        "BTC_5M_PROFIT_PROTECT_GIVEBACK",
+        "BTC_5M_PROFIT_PROTECT_MIN_BEST_NET",
+        "BTC_5M_PROFIT_PROTECT_MAX_GIVEBACK_EXIT_LOSS",
+    ]
+
+    print("[BTC5M] active config:")
+    for key in keys:
+        print(f"[BTC5M]   {key}={os.getenv(key)}")
 
 
 def live_mode_is_armed() -> bool:
@@ -97,18 +186,15 @@ def get_live_client() -> ClobClient:
         api_secret=os.getenv("CLOB_SECRET"),
         api_passphrase=os.getenv("CLOB_PASS_PHRASE"),
     )
-
-    missing_creds = [
-        name
-        for name, value in {
+    missing = [
+        name for name, value in {
             "CLOB_API_KEY": creds.api_key,
             "CLOB_SECRET": creds.api_secret,
             "CLOB_PASS_PHRASE": creds.api_passphrase,
-        }.items()
-        if not value
+        }.items() if not value
     ]
-    if missing_creds:
-        raise RuntimeError(f"Missing CLOB credentials in .env: {', '.join(missing_creds)}")
+    if missing:
+        raise RuntimeError(f"Missing CLOB credentials in .env: {', '.join(missing)}")
 
     return ClobClient(
         host,
@@ -135,18 +221,15 @@ def get_live_client_v2() -> V2ClobClient:
         api_secret=os.getenv("CLOB_SECRET"),
         api_passphrase=os.getenv("CLOB_PASS_PHRASE"),
     )
-
-    missing_creds = [
-        name
-        for name, value in {
+    missing = [
+        name for name, value in {
             "CLOB_API_KEY": creds.api_key,
             "CLOB_SECRET": creds.api_secret,
             "CLOB_PASS_PHRASE": creds.api_passphrase,
-        }.items()
-        if not value
+        }.items() if not value
     ]
-    if missing_creds:
-        raise RuntimeError(f"Missing CLOB credentials in .env: {', '.join(missing_creds)}")
+    if missing:
+        raise RuntimeError(f"Missing CLOB credentials in .env: {', '.join(missing)}")
 
     return V2ClobClient(
         host=host,
@@ -187,6 +270,18 @@ def safe_float_from_obj(value: Any, keys: Optional[list[str]] = None, default: f
 
     return default
 
+
+def normalize_token_balance(raw_balance: float) -> float:
+    # Polymarket returns USDC/token balances in 1e6 units in many endpoints.
+    return raw_balance / 1_000_000 if raw_balance > 10_000 else raw_balance
+
+def is_zero_token_balance_error(error_text: str) -> bool:
+    text = str(error_text).lower()
+    return (
+        "not enough balance / allowance" in text
+        or "balance is not enough" in text
+        or "balance: 0" in text
+    )
 
 def read_collateral_balance_allowance(client: V2ClobClient) -> dict[str, Any]:
     raw = client.get_balance_allowance(
@@ -245,27 +340,23 @@ def read_conditional_balance_allowance(client: V2ClobClient, token_id: str) -> d
     return {"raw": raw, "balance": balance, "allowance": allowance}
 
 
-def normalize_usdc_balance(raw_balance: float) -> float:
-    return raw_balance / 1_000_000 if raw_balance > 10_000 else raw_balance
-
-
 def ensure_live_balance_for_buy(price: float, size: float) -> dict[str, Any]:
     client = get_live_client_v2()
     info = read_collateral_balance_allowance(client)
 
     required = float(price) * float(size)
-    balance = normalize_usdc_balance(float(info["balance"]))
+    balance = normalize_token_balance(float(info["balance"]))
     allowance = float(info["allowance"])
 
     if balance <= 0:
-        raise RuntimeError(f"Live BUY blocked: collateral balance appears zero. raw={info['raw']}")
+        raise LiveOrderPreCheckBlocked(f"Live BUY blocked: collateral balance appears zero. raw={info['raw']}")
     if balance < required:
-        raise RuntimeError(
+        raise LiveOrderPreCheckBlocked(
             f"Live BUY blocked: insufficient collateral balance. "
             f"required={required:.4f}, balance={balance:.4f}, raw={info['raw']}"
         )
     if allowance <= 0:
-        raise RuntimeError(f"Live BUY blocked: collateral allowance appears zero. raw={info['raw']}")
+        raise LiveOrderPreCheckBlocked(f"Live BUY blocked: collateral allowance appears zero. raw={info['raw']}")
 
     return info
 
@@ -279,7 +370,7 @@ def ensure_live_balance_for_sell(position: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("Live SELL blocked: missing token_id")
 
     info = read_conditional_balance_allowance(client, str(token_id))
-    balance = normalize_usdc_balance(float(info["balance"]))
+    balance = normalize_token_balance(float(info["balance"]))
     allowance = float(info["allowance"])
 
     if balance < size:
@@ -292,6 +383,14 @@ def ensure_live_balance_for_sell(position: dict[str, Any]) -> dict[str, Any]:
 
     return info
 
+def get_live_token_balance_for_position(position: dict[str, Any]) -> float:
+    token_id = position.get("token_id")
+    if not token_id:
+        return 0.0
+
+    client = get_live_client_v2()
+    info = read_conditional_balance_allowance(client, str(token_id))
+    return normalize_token_balance(float(info.get("balance", 0.0)))
 
 def extract_order_id(response: Any) -> Optional[str]:
     if response is None:
@@ -341,8 +440,16 @@ def extract_order_status_fields(order_info: Any) -> dict[str, Any]:
             or order_info.get("sizeMatched")
             or 0
         )
-        remaining_size = order_info.get("remaining_size") or order_info.get("remainingSize") or order_info.get("remaining")
-        avg_fill_price = order_info.get("avg_fill_price") or order_info.get("avgFillPrice") or order_info.get("price")
+        remaining_size = (
+            order_info.get("remaining_size")
+            or order_info.get("remainingSize")
+            or order_info.get("remaining")
+        )
+        avg_fill_price = (
+            order_info.get("avg_fill_price")
+            or order_info.get("avgFillPrice")
+            or order_info.get("price")
+        )
     else:
         status = str(getattr(order_info, "status", None) or getattr(order_info, "state", None) or "unknown").lower()
         filled_size = (
@@ -355,8 +462,16 @@ def extract_order_status_fields(order_info: Any) -> dict[str, Any]:
             or getattr(order_info, "sizeMatched", None)
             or 0
         )
-        remaining_size = getattr(order_info, "remaining_size", None) or getattr(order_info, "remainingSize", None) or getattr(order_info, "remaining", None)
-        avg_fill_price = getattr(order_info, "avg_fill_price", None) or getattr(order_info, "avgFillPrice", None) or getattr(order_info, "price", None)
+        remaining_size = (
+            getattr(order_info, "remaining_size", None)
+            or getattr(order_info, "remainingSize", None)
+            or getattr(order_info, "remaining", None)
+        )
+        avg_fill_price = (
+            getattr(order_info, "avg_fill_price", None)
+            or getattr(order_info, "avgFillPrice", None)
+            or getattr(order_info, "price", None)
+        )
 
     try:
         filled_size = float(filled_size)
@@ -404,12 +519,11 @@ def extract_buy_fill_from_post_response(response: Any, fallback_price: float) ->
     if shares_received <= 0:
         return None
 
-    avg_price = usdc_paid / shares_received if usdc_paid > 0 else fallback_price
     return {
         "status": status or "matched",
         "filled_size": shares_received,
         "remaining_size": 0.0,
-        "avg_fill_price": avg_price,
+        "avg_fill_price": usdc_paid / shares_received if usdc_paid > 0 else fallback_price,
         "raw": response,
         "fill_state": "filled_from_post_response",
     }
@@ -437,12 +551,11 @@ def extract_sell_fill_from_post_response(response: Any, fallback_price: float) -
     if shares_sold <= 0:
         return None
 
-    avg_price = usdc_received / shares_sold if usdc_received > 0 else fallback_price
     return {
         "status": status or "matched",
         "filled_size": shares_sold,
         "remaining_size": 0.0,
-        "avg_fill_price": avg_price,
+        "avg_fill_price": usdc_received / shares_sold if usdc_received > 0 else fallback_price,
         "raw": response,
         "fill_state": "filled_from_post_response",
     }
@@ -460,8 +573,6 @@ def cancel_order_safe(client: V2ClobClient, order_id: str) -> bool:
     if not order_id:
         return False
 
-    # py-clob-client-v2 cancel_order can expect an object in some versions;
-    # cancel_orders([id]) is safer in the observed local client.
     if hasattr(client, "cancel_orders"):
         try:
             client.cancel_orders([order_id])
@@ -496,45 +607,77 @@ def wait_for_order_fill(client: V2ClobClient, order_id: str, requested_size: flo
 
     deadline = time.time() + float(timeout_seconds)
     last_fields: Optional[dict[str, Any]] = None
+    best_partial: Optional[dict[str, Any]] = None
 
     while time.time() < deadline:
         fields = extract_order_status_fields(get_order_info_safe(client, order_id))
         last_fields = fields
-        filled_size = float(fields["filled_size"])
-        remaining_size = fields["remaining_size"]
-        status = fields["status"]
+
+        filled_size = float(fields.get("filled_size", 0.0) or 0.0)
+        remaining_size = fields.get("remaining_size")
+        status = str(fields.get("status", "unknown")).lower()
 
         if filled_size >= float(requested_size):
             fields["fill_state"] = "filled"
+            fields["cancel_succeeded"] = False
             return fields
 
         if filled_size >= min_filled_size:
-            fields["fill_state"] = "filled" if remaining_size is None or remaining_size <= 0 else "partial"
-            return fields
+            best_partial = fields.copy()
+            best_partial["fill_state"] = "partial_seen"
+
+            # If API explicitly says no remaining size, treat as filled.
+            if remaining_size is not None and remaining_size <= 0:
+                best_partial["fill_state"] = "filled"
+                best_partial["cancel_succeeded"] = False
+                return best_partial
+
+            # Do NOT return immediately on partial fill.
+            # Keep waiting so later partial fills can be included.
 
         if status in {"filled", "matched"}:
             raw = fields.get("raw")
+            raw_size_f = 0.0
+
             if isinstance(raw, dict):
                 raw_size = raw.get("size_matched") or raw.get("sizeMatched")
                 try:
-                    raw_size_f = float(raw_size)
-                    if raw_size_f > 0:
-                        fields["filled_size"] = raw_size_f
-                        fields["fill_state"] = "filled"
-                        return fields
+                    raw_size_f = float(raw_size or 0)
                 except Exception:
-                    pass
+                    raw_size_f = 0.0
+
+            if raw_size_f > 0:
+                fields["filled_size"] = raw_size_f
+                if raw_size_f >= float(requested_size):
+                    fields["fill_state"] = "filled"
+                else:
+                    fields["fill_state"] = "partial_seen"
+                    best_partial = fields.copy()
+                    time.sleep(poll_seconds)
+                    continue
+
+                fields["cancel_succeeded"] = False
+                return fields
+
             fields["fill_state"] = "matched_but_size_unknown"
+            fields["cancel_succeeded"] = False
             return fields
 
         if status in {"cancelled", "canceled", "rejected", "expired", "failed"}:
             fields["fill_state"] = status
+            fields["cancel_succeeded"] = status in {"cancelled", "canceled"}
             return fields
 
         time.sleep(poll_seconds)
 
+    cancel_succeeded = False
     if cancel_stale:
-        cancel_order_safe(client, order_id)
+        cancel_succeeded = cancel_order_safe(client, order_id)
+
+    if best_partial is not None:
+        best_partial["fill_state"] = "partial_after_timeout"
+        best_partial["cancel_succeeded"] = cancel_succeeded
+        return best_partial
 
     if last_fields is None:
         last_fields = {
@@ -544,9 +687,83 @@ def wait_for_order_fill(client: V2ClobClient, order_id: str, requested_size: flo
             "avg_fill_price": None,
             "raw": None,
         }
+
     last_fields["fill_state"] = "timeout"
+    last_fields["cancel_succeeded"] = cancel_succeeded
     return last_fields
 
+
+def verify_post_cancel_buy_fill(
+    client: V2ClobClient,
+    order_id: str,
+    token_id: str,
+    requested_size: float,
+    fallback_price: float,
+) -> Optional[dict[str, Any]]:
+    order_info = get_order_info_safe(client, order_id)
+    fields = extract_order_status_fields(order_info)
+
+    filled_size = float(fields.get("filled_size", 0.0) or 0.0)
+    if filled_size > 0:
+        fields["fill_state"] = "filled_after_cancel_recheck"
+        if fields.get("avg_fill_price") is None:
+            fields["avg_fill_price"] = fallback_price
+        return fields
+
+    try:
+        info = read_conditional_balance_allowance(client, str(token_id))
+        token_balance = normalize_token_balance(float(info.get("balance", 0.0)))
+        if token_balance > 0:
+            return {
+                "status": "filled_by_token_balance",
+                "filled_size": min(token_balance, float(requested_size)),
+                "remaining_size": 0.0,
+                "avg_fill_price": fallback_price,
+                "raw": {"order_info": order_info, "token_balance_info": info["raw"]},
+                "fill_state": "filled_by_token_balance_after_cancel",
+            }
+    except Exception as e:
+        print(f"[BTC5M] post-cancel token balance check failed for {order_id}: {e}")
+
+    return None
+
+def reconcile_buy_fill_with_token_balance(
+    client: V2ClobClient,
+    token_id: str,
+    reported_filled_size: float,
+    requested_size: float,
+    fallback_price: float,
+) -> dict[str, Any]:
+    try:
+        info = read_conditional_balance_allowance(client, str(token_id))
+        token_balance = normalize_token_balance(float(info.get("balance", 0.0)))
+
+        if token_balance > reported_filled_size:
+            return {
+                "filled_size": min(token_balance, float(requested_size)),
+                "avg_fill_price": fallback_price,
+                "token_balance": token_balance,
+                "used_token_balance": True,
+                "raw": info["raw"],
+            }
+
+        return {
+            "filled_size": reported_filled_size,
+            "avg_fill_price": fallback_price,
+            "token_balance": token_balance,
+            "used_token_balance": False,
+            "raw": info["raw"],
+        }
+
+    except Exception as e:
+        print(f"[BTC5M] buy token balance reconciliation failed for token={token_id}: {e}")
+        return {
+            "filled_size": reported_filled_size,
+            "avg_fill_price": fallback_price,
+            "token_balance": None,
+            "used_token_balance": False,
+            "raw": str(e),
+        }
 
 def live_daily_loss_exceeded(state: dict[str, Any]) -> bool:
     if os.getenv("BTC_5M_MODE", "paper").lower() != "live":
@@ -563,8 +780,14 @@ def normalize_open_order(order: Any) -> dict[str, Any]:
             "status": order.get("status") or order.get("state"),
             "raw": order,
         }
+
     return {
-        "id": getattr(order, "id", None) or getattr(order, "orderID", None) or getattr(order, "orderId", None) or getattr(order, "order_id", None),
+        "id": (
+            getattr(order, "id", None)
+            or getattr(order, "orderID", None)
+            or getattr(order, "orderId", None)
+            or getattr(order, "order_id", None)
+        ),
         "status": getattr(order, "status", None) or getattr(order, "state", None),
         "raw": order,
     }
@@ -672,26 +895,37 @@ def calculate_live_buy_size(price: float, decision_size: float) -> tuple[float, 
     order_value = price * size
 
     if order_value > max_order_value:
-        raise RuntimeError(
+        raise LiveOrderPreCheckBlocked(
             f"Live order blocked by max value: order_value={order_value:.4f}, limit={max_order_value:.4f}"
         )
+
     return size, order_value
 
 
 def place_live_limit_buy(snapshot: dict[str, Any], decision: Any) -> dict[str, Any]:
     if not live_mode_is_armed():
-        raise RuntimeError(
+        raise LiveOrderPreCheckBlocked(
             "Live order blocked. Require BTC_5M_MODE=live, "
             "BTC_5M_LIVE_ARMED=true, and BTC_5M_ALLOW_REAL_ORDERS=true."
         )
 
-    price = float(decision.price)
+    base_price = float(decision.price)
+    entry_slippage = float(os.getenv("BTC_5M_ENTRY_SLIPPAGE", "0.00"))
+    price = min(0.99, base_price + entry_slippage)
     if price <= 0 or price >= 1:
-        raise RuntimeError(f"Invalid live order price: {price}")
+        raise LiveOrderPreCheckBlocked(f"Invalid live order price: {price}")
+
+    if decision.edge is not None and entry_slippage > 0:
+        adjusted_edge = float(decision.edge) - entry_slippage
+        if adjusted_edge < float(os.getenv("BTC_5M_MIN_EDGE", "0.05")):
+            raise LiveOrderPreCheckBlocked(
+                f"Live BUY blocked: adjusted edge too small after slippage. "
+                f"edge={decision.edge:.4f}, slippage={entry_slippage:.4f}, adjusted={adjusted_edge:.4f}"
+            )
 
     size, order_value = calculate_live_buy_size(price, float(decision.size))
     if size <= 0:
-        raise RuntimeError(f"Invalid live order size: {size}")
+        raise LiveOrderPreCheckBlocked(f"Invalid live order size: {size}")
 
     token_id = token_id_for_decision(snapshot, decision)
     balance_info = ensure_live_balance_for_buy(price, size)
@@ -728,13 +962,124 @@ def place_live_limit_buy(snapshot: dict[str, Any], decision: Any) -> dict[str, A
 
     filled_size = float(fill.get("filled_size", 0.0))
     fill_state = fill.get("fill_state", "unknown")
+
     if filled_size <= 0:
-        raise RuntimeError(
-            f"Live BUY not filled. order_id={order_id} fill_state={fill_state} "
-            f"fill={fill} post_response={response}"
-        )
+        fill_status = str(fill.get("status", "")).lower()
+        raw = fill.get("raw") if isinstance(fill, dict) else None
+        raw_size_matched = None
+        if isinstance(raw, dict):
+            raw_size_matched = raw.get("size_matched") or raw.get("sizeMatched")
+
+        try:
+            raw_size_matched_f = float(raw_size_matched or 0)
+        except Exception:
+            raw_size_matched_f = 0.0
+
+        cancel_succeeded = bool(fill.get("cancel_succeeded", False))
+
+        if (
+            fill_state == "timeout"
+            and raw_size_matched_f <= 0
+            and fill_status in {"live", "unknown", "timeout"}
+        ):
+            if not cancel_succeeded:
+                raise RuntimeError(
+                    f"Live BUY timeout and cancel not confirmed. order_id={order_id} "
+                    f"fill={fill} post_response={response}"
+                )
+
+            post_cancel_fill = None
+            for _ in range(2):
+                post_cancel_fill = verify_post_cancel_buy_fill(
+                    client=client,
+                    order_id=order_id,
+                    token_id=str(token_id),
+                    requested_size=size,
+                    fallback_price=price,
+                )
+                if post_cancel_fill is not None:
+                    break
+                time.sleep(1)
+
+            if post_cancel_fill is not None:
+                fill = post_cancel_fill
+                filled_size = float(fill.get("filled_size", 0.0))
+                fill_state = fill.get("fill_state", "filled_after_cancel_recheck")
+                fill_status = str(fill.get("status", "")).lower()
+                raw = fill.get("raw") if isinstance(fill, dict) else None
+                raw_size_matched_f = filled_size
+
+        if filled_size <= 0:
+            if (
+                fill_state == "timeout"
+                and raw_size_matched_f <= 0
+                and fill_status in {"live", "unknown", "timeout"}
+                and cancel_succeeded
+            ):
+                log_trade([
+                    utc_now(),
+                    "live",
+                    snapshot["market_id"],
+                    "ORDER_UNFILLED_CANCELLED",
+                    decision.outcome,
+                    price,
+                    size,
+                    False,
+                    f"order_id={order_id} fill={fill} post_response={response}",
+                    0.0,
+                ])
+
+                raise LiveOrderUnfilledCancelled(
+                    f"Live BUY unfilled and cancelled. order_id={order_id} "
+                    f"fill_state={fill_state} fill={fill} post_response={response}"
+                )
+
+            raise RuntimeError(
+                f"Live BUY not filled. order_id={order_id} fill_state={fill_state} "
+                f"fill={fill} post_response={response}"
+            )
 
     avg_fill_price = float(fill.get("avg_fill_price") or price)
+
+    actual_shares = filled_size
+    actual_cost = avg_fill_price * actual_shares
+
+    raw_fill = fill.get("raw") if isinstance(fill, dict) else None
+    if isinstance(raw_fill, dict):
+        try:
+            if raw_fill.get("takingAmount") not in (None, ""):
+                actual_shares = float(raw_fill.get("takingAmount"))
+            if raw_fill.get("makingAmount") not in (None, ""):
+                actual_cost = float(raw_fill.get("makingAmount"))
+            if actual_shares > 0 and actual_cost > 0:
+                avg_fill_price = actual_cost / actual_shares
+                filled_size = actual_shares
+        except Exception as e:
+            print(f"[BTC5M] BUY accounting parse warning: {e}")
+
+    reconciled = reconcile_buy_fill_with_token_balance(
+        client=client,
+        token_id=str(token_id),
+        reported_filled_size=filled_size,
+        requested_size=size,
+        fallback_price=avg_fill_price,
+    )
+
+    reconciled_size = float(reconciled["filled_size"])
+    if reconciled_size > filled_size:
+        print(
+            f"[BTC5M] BUY size reconciled from order fill to token balance: "
+            f"order_fill={filled_size:.4f} token_balance={reconciled_size:.4f}"
+        )
+        # Keep price from actual order cost if known; increase cost basis proportionally
+        # only when CLOB did not report enough fill size.
+        if filled_size > 0 and actual_cost > 0:
+            actual_cost = avg_fill_price * reconciled_size
+        filled_size = reconciled_size
+
+    actual_shares = filled_size
+    actual_cost = avg_fill_price * actual_shares
+
     return {
         "response": response,
         "order_id": order_id,
@@ -745,8 +1090,11 @@ def place_live_limit_buy(snapshot: dict[str, Any], decision: Any) -> dict[str, A
         "limit_price": price,
         "size": filled_size,
         "requested_size": size,
-        "order_value": avg_fill_price * filled_size,
+        "order_value": actual_cost,
+        "actual_buy_cost": actual_cost,
+        "actual_buy_shares": actual_shares,
         "balance_info": str(balance_info["raw"]),
+        "token_balance_reconciliation": str(reconciled),
     }
 
 
@@ -805,10 +1153,35 @@ def place_live_limit_sell(position: dict[str, Any], exit_price: float) -> dict[s
     if filled_size <= 0:
         raise RuntimeError(
             f"Live SELL not filled. order_id={order_id} fill_state={fill_state} "
+            f"cancel_succeeded={fill.get('cancel_succeeded', None)} "
             f"fill={fill} post_response={response}"
         )
 
     avg_fill_price = float(fill.get("avg_fill_price") or price)
+
+    actual_shares_sold = filled_size
+    actual_sell_proceeds = avg_fill_price * actual_shares_sold
+
+    raw_fill = fill.get("raw") if isinstance(fill, dict) else None
+    if isinstance(raw_fill, dict):
+        try:
+            if raw_fill.get("makingAmount") not in (None, ""):
+                actual_shares_sold = float(raw_fill.get("makingAmount"))
+            if raw_fill.get("takingAmount") not in (None, ""):
+                actual_sell_proceeds = float(raw_fill.get("takingAmount"))
+            if actual_shares_sold > 0 and actual_sell_proceeds > 0:
+                avg_fill_price = actual_sell_proceeds / actual_shares_sold
+                filled_size = actual_shares_sold
+        except Exception as e:
+            print(f"[BTC5M] SELL accounting parse warning: {e}")
+
+    remaining_token_balance = None
+    try:
+        post_sell_info = read_conditional_balance_allowance(client, str(token_id))
+        remaining_token_balance = normalize_token_balance(float(post_sell_info.get("balance", 0.0)))
+    except Exception as e:
+        print(f"[BTC5M] post-sell token balance check failed for token={token_id}: {e}")
+
     return {
         "response": response,
         "order_id": order_id,
@@ -818,6 +1191,9 @@ def place_live_limit_sell(position: dict[str, Any], exit_price: float) -> dict[s
         "price": avg_fill_price,
         "limit_price": price,
         "size": filled_size,
+        "actual_sell_proceeds": actual_sell_proceeds,
+        "actual_sell_shares": actual_shares_sold,
+        "remaining_token_balance": remaining_token_balance,
         "balance_info": str(balance_info["raw"]),
     }
 
@@ -833,6 +1209,7 @@ def settle_expired_positions(state: dict[str, Any]) -> None:
     for market_id, position in list(open_positions.items()):
         if position.get("resolved"):
             continue
+
         entry_ts_raw = position.get("timestamp")
         if not entry_ts_raw:
             continue
@@ -863,6 +1240,7 @@ def settle_expired_positions(state: dict[str, Any]) -> None:
             if resp.status_code != 200:
                 print(f"[BTC5M] settlement Binance error {resp.status_code} for {market_id}")
                 continue
+
             candles = resp.json()
             if not candles:
                 print(f"[BTC5M] settlement no candle found for {market_id}")
@@ -932,6 +1310,13 @@ def maybe_cashout_profitable_position(state: dict[str, Any], snapshot: dict[str,
         return False
 
     position = open_positions[market_id]
+    if position.get("reconcile_required"):
+        print(
+            f"[BTC5M] position {market_id} requires manual reconciliation, "
+            "skipping automated exit attempts"
+        )
+        return False
+
     outcome = position["outcome"]
     entry_price = float(position["entry_price"])
     size = float(position["size"])
@@ -951,7 +1336,21 @@ def maybe_cashout_profitable_position(state: dict[str, Any], snapshot: dict[str,
     min_net_profit = float(os.getenv("BTC_5M_MIN_NET_PROFIT", "0.02"))
     extra_fee_buffer = float(os.getenv("BTC_5M_EXTRA_FEE_BUFFER", "0.01"))
     max_net_loss = float(os.getenv("BTC_5M_MAX_NET_LOSS", "0.75"))
+    hard_max_net_loss = float(os.getenv("BTC_5M_HARD_MAX_NET_LOSS", "0"))
     enable_stoploss = os.getenv("BTC_5M_ENABLE_STOPLOSS", "true").lower() == "true"
+    enable_profit_protection = os.getenv("BTC_5M_ENABLE_PROFIT_PROTECTION", "false").lower() == "true"
+    profit_protect_arm_net = float(os.getenv("BTC_5M_PROFIT_PROTECT_ARM_NET", "0.15"))
+    profit_protect_exit_net = float(os.getenv("BTC_5M_PROFIT_PROTECT_EXIT_NET", "0.00"))
+    profit_protect_min_seconds = int(os.getenv("BTC_5M_PROFIT_PROTECT_MIN_SECONDS", "90"))
+    profit_protect_thesis_flip_exit = (
+        os.getenv("BTC_5M_PROFIT_PROTECT_THESIS_FLIP_EXIT", "true").lower() == "true"
+    )
+    profit_protect_max_exit_loss = float(os.getenv("BTC_5M_PROFIT_PROTECT_MAX_EXIT_LOSS", "0.25"))
+    profit_protect_giveback = float(os.getenv("BTC_5M_PROFIT_PROTECT_GIVEBACK", "0.45"))
+    profit_protect_min_best_net = float(os.getenv("BTC_5M_PROFIT_PROTECT_MIN_BEST_NET", "0.30"))
+    profit_protect_max_giveback_exit_loss = float(
+        os.getenv("BTC_5M_PROFIT_PROTECT_MAX_GIVEBACK_EXIT_LOSS", "0.35")
+    )
 
     gross_pnl = (exit_price - entry_price) * size
     fee_buffer_cost = extra_fee_buffer * size
@@ -960,26 +1359,204 @@ def maybe_cashout_profitable_position(state: dict[str, Any], snapshot: dict[str,
     btc_price = float(snapshot["btc_price"])
     strike = float(position["strike"])
     thesis_invalidated = (outcome == "YES" and btc_price <= strike) or (outcome == "NO" and btc_price >= strike)
-
-    should_take_profit = net_pnl >= min_net_profit * size
-    force_exit_seconds = int(os.getenv("BTC_5M_FORCE_EXIT_SECONDS", "45"))
+    distance_from_strike = abs(btc_price - strike) / strike if strike > 0 else 0.0
+    
+    force_exit_seconds = int(os.getenv("BTC_5M_FORCE_EXIT_SECONDS", "105"))
     force_exit_min_net = float(os.getenv("BTC_5M_FORCE_EXIT_MIN_NET", "-0.20"))
-    seconds_to_expiry = int(snapshot.get("seconds_to_expiry", 999))
-    should_force_time_exit = seconds_to_expiry <= force_exit_seconds and net_pnl >= force_exit_min_net
-    should_stop_loss = enable_stoploss and net_pnl <= -max_net_loss and thesis_invalidated
 
-    if not should_take_profit and not should_force_time_exit and not should_stop_loss:
+    strong_thesis_hold_seconds = int(os.getenv("BTC_5M_STRONG_THESIS_HOLD_SECONDS", "90"))
+    strong_thesis_min_net = float(os.getenv("BTC_5M_STRONG_THESIS_MIN_NET", "0.00"))
+    strong_thesis_min_distance = float(os.getenv("BTC_5M_STRONG_THESIS_MIN_DISTANCE", "0.00018"))
+    force_exit_flat_net = float(os.getenv("BTC_5M_FORCE_EXIT_FLAT_NET", "0.05"))
+
+    seconds_to_expiry = int(snapshot.get("seconds_to_expiry", 999))
+
+    thesis_valid = (
+        (outcome == "YES" and btc_price > strike)
+        or (outcome == "NO" and btc_price < strike)
+    )
+
+    thesis_strong = (
+        thesis_valid
+        and distance_from_strike >= strong_thesis_min_distance
+        and net_pnl >= strong_thesis_min_net
+    )
+
+    thesis_weakening = (
+        thesis_invalidated
+        or not thesis_valid
+        or distance_from_strike < strong_thesis_min_distance
+    )
+    profit_protection_active = bool(position.get("profit_protection_active", False))
+
+    if enable_profit_protection and seconds_to_expiry >= profit_protect_min_seconds:
+        best_net_pnl_seen = max(float(position.get("best_net_pnl_seen", net_pnl)), net_pnl)
+        position["best_net_pnl_seen"] = best_net_pnl_seen
+
+        if not profit_protection_active and best_net_pnl_seen >= profit_protect_arm_net:
+            profit_protection_active = True
+            position["profit_protection_active"] = True
+            position["profit_protection_armed_at"] = utc_now()
+            position["profit_protection_arm_net"] = best_net_pnl_seen
+            print(
+                f"[BTC5M] PROFIT_PROTECTION armed {outcome} "
+                f"entry={entry_price} bid={exit_price} net={net_pnl:.4f} "
+                f"best_net={best_net_pnl_seen:.4f}"
+            )
+
+    base_profit_target = min_net_profit * size
+
+    enable_trailing = os.getenv("BTC_5M_ENABLE_TRAILING_PROFIT", "false").lower() == "true"
+    trail_activate_net = float(os.getenv("BTC_5M_TRAIL_ACTIVATE_NET", "0.30"))
+    trail_drop = float(os.getenv("BTC_5M_TRAIL_DROP", "0.08"))
+    trail_min_seconds = int(os.getenv("BTC_5M_TRAIL_MIN_SECONDS_TO_EXPIRY", "90"))
+    trail_force_cashout_net = float(os.getenv("BTC_5M_TRAIL_FORCE_CASHOUT_NET", "0.90"))
+    
+    should_stop_loss = enable_stoploss and net_pnl <= -max_net_loss and thesis_invalidated
+    should_hard_stop_loss = (
+        enable_stoploss
+        and hard_max_net_loss > 0
+        and net_pnl <= -abs(hard_max_net_loss)
+    )
+    in_force_exit_window = seconds_to_expiry <= force_exit_seconds
+    in_final_exit_window = seconds_to_expiry <= strong_thesis_hold_seconds
+
+    should_profit_protect_exit = False
+    should_profit_protect_thesis_flip_exit = False  
+    should_force_time_exit = False
+
+    if in_force_exit_window:
+        # Final window: do not keep holding. Exit if the configured minimum net allows it.
+        if in_final_exit_window:
+            should_force_time_exit = net_pnl >= force_exit_min_net
+
+        # Between FORCE_EXIT_SECONDS and STRONG_THESIS_HOLD_SECONDS:
+        # Hold only if the trade is winning and thesis is still strong.
+        elif thesis_strong:
+            should_force_time_exit = False
+
+        # Exit flat/small-profit/small-loss positions.
+        elif net_pnl >= -abs(force_exit_flat_net):
+            should_force_time_exit = True
+
+        # Exit if thesis is weakening but still above the configured minimum exit threshold.
+        elif thesis_weakening and net_pnl >= force_exit_min_net:
+            should_force_time_exit = True
+    
+    if enable_profit_protection and profit_protection_active:
+        # Profit protection should not exit a still-valid thesis just because the bid dips.
+        # It should only exit when BTC actually crosses against the position.
+        if (
+            seconds_to_expiry >= profit_protect_min_seconds
+            and thesis_invalidated
+            and net_pnl <= profit_protect_exit_net
+            and net_pnl >= -abs(profit_protect_max_exit_loss)
+        ):
+            should_profit_protect_exit = True
+
+        if (
+            profit_protect_thesis_flip_exit
+            and thesis_invalidated
+            and net_pnl >= -abs(profit_protect_max_exit_loss)
+        ):
+            should_profit_protect_thesis_flip_exit = True
+            
+        best_net_pnl_seen = float(position.get("best_net_pnl_seen", net_pnl))
+        
+        if (
+            best_net_pnl_seen >= profit_protect_min_best_net
+            and net_pnl <= best_net_pnl_seen - profit_protect_giveback
+            and net_pnl >= -abs(profit_protect_max_giveback_exit_loss)
+        ):
+            should_profit_protect_exit = True
+
+    trailing_active = bool(position.get("trailing_active", False))
+    should_take_profit = net_pnl >= base_profit_target
+    should_trailing_exit = False
+
+    if (
+        enable_trailing
+        and not should_stop_loss
+        and not should_hard_stop_loss
+        and not should_force_time_exit
+        and not should_profit_protect_exit
+        and not should_profit_protect_thesis_flip_exit
+    ):
+        if net_pnl >= trail_force_cashout_net:
+            should_take_profit = True
+
+        elif seconds_to_expiry <= trail_min_seconds:
+            if trailing_active:
+                should_trailing_exit = net_pnl >= force_exit_min_net
+                should_take_profit = False
+            else:
+                should_take_profit = net_pnl >= base_profit_target
+
+        elif net_pnl >= trail_activate_net:
+            best_exit_price = float(position.get("best_exit_price", exit_price))
+            if exit_price > best_exit_price:
+                best_exit_price = exit_price
+
+            position["trailing_active"] = True
+            position["best_exit_price"] = best_exit_price
+            position["best_net_pnl"] = max(float(position.get("best_net_pnl", net_pnl)), net_pnl)
+            position["trailing_updated_at"] = utc_now()
+
+            print(
+                f"[BTC5M] TRAILING {outcome} active "
+                f"entry={entry_price} bid={exit_price} "
+                f"best_bid={best_exit_price} net={net_pnl:.4f}"
+            )
+
+            should_take_profit = False
+            if exit_price <= best_exit_price - trail_drop:
+                should_trailing_exit = True
+
+        elif trailing_active:
+            best_exit_price = float(position.get("best_exit_price", exit_price))
+            should_take_profit = False
+            if exit_price <= best_exit_price - trail_drop:
+                should_trailing_exit = True
+
+    if (
+    not should_take_profit
+    and not should_trailing_exit
+    and not should_force_time_exit
+    and not should_profit_protect_exit
+    and not should_profit_protect_thesis_flip_exit
+    and not should_stop_loss
+    and not should_hard_stop_loss
+    ):
         return False
 
-    if should_take_profit:
+    if should_hard_stop_loss:
+        close_reason = "hard_stop_loss"
+        trade_action = "STOPLOSS"
+    elif should_stop_loss:
+        close_reason = "stop_loss"
+        trade_action = "STOPLOSS"
+    elif should_profit_protect_thesis_flip_exit:
+        close_reason = "profit_protect_thesis_flip"
+        trade_action = "PROTECT_EXIT"
+    elif should_profit_protect_exit:
+        close_reason = "profit_protect_breakeven"
+        trade_action = "PROTECT_EXIT"
+    elif should_trailing_exit:
+        close_reason = "trailing_profit"
+        trade_action = "TRAIL_EXIT"
+    elif should_take_profit:
         close_reason = "cashout_profit"
         trade_action = "CASHOUT"
     elif should_force_time_exit:
-        close_reason = "force_time_exit"
-        trade_action = "TIME_EXIT"
+        if net_pnl > 0:
+            close_reason = "time_cashout_profit"
+            trade_action = "CASHOUT"
+        else:
+            close_reason = "force_time_exit"
+            trade_action = "TIME_EXIT"
     else:
-        close_reason = "stop_loss"
-        trade_action = "STOPLOSS"
+        close_reason = "unknown_exit"
+        trade_action = "EXIT"
 
     mode = os.getenv("BTC_5M_MODE", "paper").lower()
     simulated = mode != "live"
@@ -989,8 +1566,21 @@ def maybe_cashout_profitable_position(state: dict[str, Any], snapshot: dict[str,
     if mode == "live":
         try:
             live_exit_price = exit_price
+
             if trade_action == "STOPLOSS" or (trade_action == "TIME_EXIT" and net_pnl < 0):
                 slippage_buffer = float(os.getenv("BTC_5M_STOPLOSS_EXIT_SLIPPAGE", "0.02"))
+                live_exit_price = max(0.01, exit_price - slippage_buffer)
+
+            elif trade_action == "PROTECT_EXIT":
+                slippage_buffer = float(os.getenv("BTC_5M_PROTECT_EXIT_SLIPPAGE", "0.01"))
+                live_exit_price = max(0.01, exit_price - slippage_buffer)
+
+            elif trade_action == "CASHOUT":
+                slippage_buffer = float(os.getenv("BTC_5M_CASHOUT_EXIT_SLIPPAGE", "0.01"))
+                live_exit_price = max(0.01, exit_price - slippage_buffer)
+
+            elif trade_action == "TRAIL_EXIT":
+                slippage_buffer = float(os.getenv("BTC_5M_TRAIL_EXIT_SLIPPAGE", "0.01"))
                 live_exit_price = max(0.01, exit_price - slippage_buffer)
 
             live_result = place_live_limit_sell(position, live_exit_price)
@@ -999,19 +1589,184 @@ def maybe_cashout_profitable_position(state: dict[str, Any], snapshot: dict[str,
 
             actual_exit_price = float(live_result["price"])
             actual_exit_size = float(live_result["size"])
-            gross_pnl = (actual_exit_price - entry_price) * actual_exit_size
+
+            actual_sell_proceeds = float(
+                live_result.get("actual_sell_proceeds", actual_exit_price * actual_exit_size)
+            )
+
+            position_buy_cost = float(
+                position.get("actual_buy_cost", entry_price * float(position["size"]))
+            )
+            position_buy_shares = float(
+                position.get("actual_buy_shares", position.get("size", actual_exit_size))
+            )
+
+            if position_buy_shares > 0:
+                cost_basis_for_sold_size = position_buy_cost * (actual_exit_size / position_buy_shares)
+            else:
+                cost_basis_for_sold_size = entry_price * actual_exit_size
+
+            gross_pnl = actual_sell_proceeds - cost_basis_for_sold_size
             fee_buffer_cost = extra_fee_buffer * actual_exit_size
             net_pnl = gross_pnl - fee_buffer_cost
+
             exit_price = actual_exit_price
             size = actual_exit_size
+            
+            remaining_token_balance = live_result.get("remaining_token_balance")
+            if remaining_token_balance is not None:
+                remaining_token_balance = float(remaining_token_balance)
         except Exception as e:
-            print(f"[BTC5M] LIVE EXIT FAILED/BLOCKED: {e}")
+            error_text = str(e)
+            print(f"[BTC5M] LIVE EXIT FAILED/BLOCKED: {error_text}")
+
+            if is_zero_token_balance_error(error_text):
+                try:
+                    token_balance = get_live_token_balance_for_position(position)
+                except Exception as balance_error:
+                    token_balance = -1.0
+                    position["reconcile_balance_check_error"] = str(balance_error)
+
+                if 0 <= token_balance < 0.01:
+                    actual_buy_cost = float(
+                        position.get("actual_buy_cost", entry_price * float(position["size"]))
+                    )
+                    actual_buy_shares = float(
+                        position.get("actual_buy_shares", position.get("size", size))
+                    )
+
+                    # Conservative fallback: assume the prior sell attempt happened near the current bid.
+                    # This prevents stale open_positions when Polymarket already has zero shares.
+                    estimated_sell_proceeds = exit_price * actual_buy_shares
+                    gross_pnl = estimated_sell_proceeds - actual_buy_cost
+                    fee_buffer_cost = extra_fee_buffer * actual_buy_shares
+                    net_pnl = gross_pnl - fee_buffer_cost
+
+                    state["daily_pnl"] = float(state.get("daily_pnl", 0.0)) + net_pnl
+                    state["total_pnl"] = float(state.get("total_pnl", 0.0)) + net_pnl
+
+                    reason_text = (
+                        f"zero_token_balance_reconciled_after_sell_error "
+                        f"error={error_text} token_balance={token_balance} "
+                        f"entry={entry_price} estimated_exit={exit_price} "
+                        f"estimated_sell_proceeds={estimated_sell_proceeds:.4f} "
+                        f"actual_buy_cost={actual_buy_cost:.4f} "
+                        f"gross={gross_pnl:.4f} fee_buffer={fee_buffer_cost:.4f}"
+                    )
+
+                    log_trade([
+                        utc_now(),
+                        mode,
+                        market_id,
+                        "RECONCILED_EXIT",
+                        outcome,
+                        exit_price,
+                        actual_buy_shares,
+                        False,
+                        reason_text,
+                        net_pnl,
+                    ])
+
+                    remaining_token_balance = None
+                    if live_result is not None:
+                        raw_remaining = live_result.get("remaining_token_balance")
+                        if raw_remaining is not None:
+                            try:
+                                remaining_token_balance = float(raw_remaining)
+                            except Exception:
+                                remaining_token_balance = None
+
+                    if mode == "live" and remaining_token_balance is not None and remaining_token_balance >= 0.01:
+                        original_size = float(position.get("size", size))
+                        sold_size = float(size)
+                        remaining_size = remaining_token_balance
+
+                        original_buy_cost = float(position.get("actual_buy_cost", entry_price * original_size))
+                        original_buy_shares = float(position.get("actual_buy_shares", original_size))
+
+                        if original_buy_shares > 0:
+                            sold_cost_basis = original_buy_cost * (sold_size / original_buy_shares)
+                            remaining_cost_basis = max(0.0, original_buy_cost - sold_cost_basis)
+                        else:
+                            remaining_cost_basis = entry_price * remaining_size
+
+                        position["size"] = remaining_size
+                        position["actual_buy_shares"] = remaining_size
+                        position["actual_buy_cost"] = remaining_cost_basis
+                        position["partial_exit_last_at"] = utc_now()
+                        position["partial_exit_last_reason"] = close_reason
+                        position["partial_exit_last_sold_size"] = sold_size
+                        position["partial_exit_last_remaining_size"] = remaining_size
+                        position["partial_exit_last_pnl"] = net_pnl
+                        position["partial_exit_last_order_id"] = live_result.get("order_id") if live_result else None
+
+                        log_trade([
+                            utc_now(),
+                            mode,
+                            market_id,
+                            "PARTIAL_EXIT",
+                            outcome,
+                            exit_price,
+                            sold_size,
+                            simulated,
+                            reason_text + f" remaining_token_balance={remaining_size}",
+                            net_pnl,
+                        ])
+
+                        print(
+                            f"[BTC5M] PARTIAL_EXIT {outcome} sold={sold_size:.4f} "
+                            f"remaining={remaining_size:.4f} net_after_buffer={net_pnl:.4f}"
+                        )
+
+                        return True
+
+                    closed_markets[market_id] = {
+                        "timestamp": utc_now(),
+                        "reason": close_reason,
+                        "outcome": outcome,
+                        "entry_price": entry_price,
+                        "exit_price": float(exit_price),
+                        "size": size,
+                        "net_pnl": net_pnl,
+                        "question": snapshot.get("question"),
+                    }
+                    open_positions.pop(market_id, None)
+                    print(
+                        f"[BTC5M] RECONCILED_EXIT {outcome} token balance is zero; "
+                        f"closing local state. estimated_net={net_pnl:.4f}"
+                    )
+                    return True
+
+                position["reconcile_required"] = True
+                position["reconcile_reason"] = error_text
+                position["reconcile_token_balance"] = token_balance
+                position["reconcile_at"] = utc_now()
+                print(
+                    f"[BTC5M] WARNING: position {market_id} marked for manual reconciliation. "
+                    f"token_balance={token_balance}. Bot will not retry automated exits."
+                )
+
             return False
 
     state["daily_pnl"] = float(state.get("daily_pnl", 0.0)) + net_pnl
     state["total_pnl"] = float(state.get("total_pnl", 0.0)) + net_pnl
 
-    reason_text = f"entry={entry_price} exit={exit_price} gross={gross_pnl:.4f} fee_buffer={fee_buffer_cost:.4f}"
+    reason_text = (
+        f"entry={entry_price} exit={exit_price} "
+        f"gross={gross_pnl:.4f} fee_buffer={fee_buffer_cost:.4f} "
+        f"best_net_pnl_seen={position.get('best_net_pnl_seen')} "
+        f"profit_protection_active={position.get('profit_protection_active')} "
+        f"thesis_valid={thesis_valid} thesis_invalidated={thesis_invalidated} "
+        f"distance_from_strike={distance_from_strike:.8f}"
+    )
+
+    if live_result is not None:
+        reason_text += (
+            f" actual_sell_proceeds={live_result.get('actual_sell_proceeds')} "
+            f"actual_sell_shares={live_result.get('actual_sell_shares')} "
+            f"actual_buy_cost={position.get('actual_buy_cost')} "
+            f"actual_buy_shares={position.get('actual_buy_shares')}"
+        )
     if live_result is not None:
         reason_text += f" exit_order_id={live_result['order_id']} exit_fill_state={live_result['fill_state']}"
     if live_response is not None:
@@ -1162,10 +1917,12 @@ def build_strategy_from_env() -> BTC5MHybridStrategy:
         min_edge=float(os.getenv("BTC_5M_MIN_EDGE", "0.05")),
         max_spread=float(os.getenv("BTC_5M_MAX_SPREAD", "0.08")),
         order_size=float(os.getenv("BTC_5M_ORDER_SIZE", "1")),
-        no_trade_last_seconds=int(os.getenv("BTC_5M_NO_TRADE_LAST_SECONDS", "75")),
-        min_seconds_to_expiry=int(os.getenv("BTC_5M_MIN_SECONDS_TO_EXPIRY", "75")),
+        no_trade_last_seconds=int(os.getenv("BTC_5M_NO_TRADE_LAST_SECONDS", "120")),
+        min_seconds_to_expiry=int(os.getenv("BTC_5M_MIN_SECONDS_TO_EXPIRY", "120")),
         max_seconds_to_expiry=int(os.getenv("BTC_5M_MAX_SECONDS_TO_EXPIRY", "240")),
-        min_distance_from_strike=float(os.getenv("BTC_5M_MIN_DISTANCE_FROM_STRIKE", "0.00008")),
+        min_distance_from_strike=float(os.getenv("BTC_5M_MIN_DISTANCE_FROM_STRIKE", "0.00012")),
+        late_distance_seconds=int(os.getenv("BTC_5M_LATE_DISTANCE_SECONDS", "150")),
+        late_min_distance_from_strike=float(os.getenv("BTC_5M_LATE_MIN_DISTANCE_FROM_STRIKE", "0.00018")),
         require_momentum_confirmation=os.getenv("BTC_5M_REQUIRE_MOMENTUM_CONFIRMATION", "true").lower() == "true",
     )
 
@@ -1175,16 +1932,17 @@ def main() -> None:
     loop_seconds = int(os.getenv("BTC_5M_LOOP_SECONDS", "10"))
     strategy = build_strategy_from_env()
 
+    ensure_csv_headers()
     state = load_state()
     state["mode"] = mode
     state = reconcile_live_state_on_startup(state)
     save_state(state)
 
     print(f"[BTC5M] bot started in {mode} mode")
+    print_startup_config()
     if mode == "live":
         missing_live_env = [
-            name
-            for name in ["PK", "CLOB_API_KEY", "CLOB_SECRET", "CLOB_PASS_PHRASE"]
+            name for name in ["PK", "CLOB_API_KEY", "CLOB_SECRET", "CLOB_PASS_PHRASE"]
             if not os.getenv(name)
         ]
         if missing_live_env:
@@ -1257,7 +2015,6 @@ def main() -> None:
                 time.sleep(loop_seconds)
                 continue
 
-            # Uncertain live failures are always blocked for the rest of that market.
             if market_id in live_failed_orders:
                 print(f"[BTC5M] market {market_id} has uncertain live failure, skipping")
                 save_state(state)
@@ -1330,6 +2087,8 @@ def main() -> None:
                         "entry_fill_state": live_result["fill_state"],
                         "entry_fill": str(live_result["fill"]),
                         "order_value": live_result["order_value"],
+                        "actual_buy_cost": live_result.get("actual_buy_cost", live_result["order_value"]),
+                        "actual_buy_shares": live_result.get("actual_buy_shares", live_result["size"]),
                         "live_response": str(live_result["response"]),
                         "resolved": False,
                     }
@@ -1349,18 +2108,52 @@ def main() -> None:
                         f"[BTC5M] LIVE BUY {decision.outcome} @ {live_result['price']} "
                         f"size={live_result['size']} value={live_result['order_value']:.4f}"
                     )
+
                 except Exception as e:
-                    print(f"[BTC5M] LIVE ORDER BLOCKED/FAILED: {e}")
+                    error_text = str(e)
+                    print(f"[BTC5M] LIVE ORDER BLOCKED/FAILED: {error_text}")
+
+                    if isinstance(e, LiveOrderPreCheckBlocked):
+                        state.setdefault("live_blocked_orders", {})[market_id] = {
+                            "timestamp": utc_now(),
+                            "reason": error_text,
+                            "question": snapshot.get("question"),
+                            "btc_price": snapshot.get("btc_price"),
+                            "strike": snapshot.get("strike"),
+                        }
+                        save_state(state)
+                        time.sleep(loop_seconds)
+                        continue
+
+                    if isinstance(e, LiveOrderUnfilledCancelled):
+                        state.setdefault("live_unfilled_cancelled_orders", {})[market_id] = {
+                            "timestamp": utc_now(),
+                            "reason": error_text,
+                            "question": snapshot.get("question"),
+                            "btc_price": snapshot.get("btc_price"),
+                            "strike": snapshot.get("strike"),
+                        }
+                        save_state(state)
+                        time.sleep(loop_seconds)
+                        continue
+
+                    state.setdefault("live_failed_orders", {})[market_id] = {
+                        "timestamp": utc_now(),
+                        "reason": error_text,
+                        "question": snapshot.get("question"),
+                        "btc_price": snapshot.get("btc_price"),
+                        "strike": snapshot.get("strike"),
+                    }
+
                     print(
                         "[BTC5M] WARNING: live order failed/uncertain after post attempt. "
                         "Check Polymarket UI immediately before continuing."
                     )
-                    live_failed_orders[market_id] = {
+
+                    state.setdefault("closed_markets", {})[market_id] = {
                         "timestamp": utc_now(),
-                        "reason": str(e),
+                        "reason": "live_order_failed_or_uncertain",
                         "question": snapshot.get("question"),
-                        "btc_price": snapshot.get("btc_price"),
-                        "strike": snapshot.get("strike"),
                     }
                     save_state(state)
 

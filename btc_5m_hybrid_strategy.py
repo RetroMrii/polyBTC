@@ -18,13 +18,15 @@ class BTC5MDecision:
 class BTC5MHybridStrategy:
     def __init__(
         self,
-        min_edge: float = 0.04,
+        min_edge: float = 0.05,
         max_spread: float = 0.08,
-        order_size: float = 1.0,
+        order_size: float = 5.0,
         no_trade_last_seconds: int = 45,
-        min_seconds_to_expiry: int = 60,
-        max_seconds_to_expiry: int = 240,
+        min_seconds_to_expiry: int = 120,
+        max_seconds_to_expiry: int = 270,
         min_distance_from_strike: float = 0.00008,
+        late_distance_seconds: int = 150,
+        late_min_distance_from_strike: float = 0.00018,
         require_momentum_confirmation: bool = True,
     ):
         self.min_edge = min_edge
@@ -34,6 +36,8 @@ class BTC5MHybridStrategy:
         self.min_seconds_to_expiry = min_seconds_to_expiry
         self.max_seconds_to_expiry = max_seconds_to_expiry
         self.min_distance_from_strike = min_distance_from_strike
+        self.late_distance_seconds = late_distance_seconds
+        self.late_min_distance_from_strike = late_min_distance_from_strike
         self.require_momentum_confirmation = require_momentum_confirmation
 
     def estimate_probability(
@@ -103,7 +107,12 @@ class BTC5MHybridStrategy:
             return self._skip("missing_no_book")
 
         distance_from_strike = (btc_price - strike) / strike if strike > 0 else 0.0
-        if abs(distance_from_strike) < self.min_distance_from_strike:
+
+        required_distance_from_strike = self.min_distance_from_strike
+        if seconds_to_expiry <= self.late_distance_seconds:
+            required_distance_from_strike = self.late_min_distance_from_strike
+
+        if abs(distance_from_strike) < required_distance_from_strike:
             return self._skip("too_close_to_strike")
 
         if self.require_momentum_confirmation:
