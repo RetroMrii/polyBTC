@@ -331,6 +331,118 @@ def get_live_token_balance_for_position(position: dict[str, Any]) -> float:
     return normalize_usdc_balance(float(info.get("balance", 0.0)))
 
 
+
+
+def read_normalized_conditional_token_balance(client: V2ClobClient, token_id: str) -> tuple[float, Any]:
+    info = read_conditional_balance_allowance(client, str(token_id))
+    return normalize_usdc_balance(float(info.get("balance", 0.0))), info.get("raw")
+
+
+def reconcile_buy_after_post_exception(
+    client: V2ClobClient,
+    snapshot: dict[str, Any],
+    decision: Any,
+    token_id: str,
+    requested_size: float,
+    fallback_price: float,
+    pre_token_balance: float,
+    error: Exception,
+) -> dict[str, Any]:
+    """Recover from create_and_post_order timing out after the CLOB may have accepted the BUY.
+
+    If the post request times out, there may be no response/order_id even though the order
+    matched. The only reliable immediate signal is conditional token balance. This function
+    polls token balance briefly; if balance increased, it returns a synthetic filled BUY
+    result so the bot can manage the live position instead of forcing manual rescue.
+    """
+    attempts = int(os.getenv("BTC_5M_POST_TIMEOUT_RECONCILE_ATTEMPTS", "4"))
+    sleep_seconds = float(os.getenv("BTC_5M_POST_TIMEOUT_RECONCILE_SLEEP_SECONDS", "1"))
+    min_filled_size = float(os.getenv("BTC_5M_MIN_FILLED_SIZE", "0.01"))
+
+    last_balance: Optional[float] = None
+    last_raw: Any = None
+
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            time.sleep(sleep_seconds)
+        try:
+            token_balance, raw = read_normalized_conditional_token_balance(client, token_id)
+            last_balance = token_balance
+            last_raw = raw
+            delta_balance = max(0.0, token_balance - pre_token_balance)
+
+            if token_balance >= min_filled_size:
+                filled_size = min(token_balance, float(requested_size))
+                fill = {
+                    "status": "filled_by_token_balance_after_post_exception",
+                    "filled_size": filled_size,
+                    "remaining_size": 0.0 if filled_size >= requested_size else max(0.0, requested_size - filled_size),
+                    "avg_fill_price": fallback_price,
+                    "raw": {
+                        "post_exception": str(error),
+                        "pre_token_balance": pre_token_balance,
+                        "post_token_balance": token_balance,
+                        "delta_token_balance": delta_balance,
+                        "token_balance_raw": raw,
+                    },
+                    "fill_state": "filled_by_token_balance_after_post_exception",
+                }
+
+                synthetic_order_id = f"UNKNOWN_POST_TIMEOUT_{snapshot['market_id']}"
+                log_trade([
+                    utc_now(),
+                    "live",
+                    snapshot["market_id"],
+                    "ORDER_POSTED",
+                    decision.outcome,
+                    fallback_price,
+                    requested_size,
+                    False,
+                    (
+                        f"live_buy_post_timeout_reconciled synthetic_order_id={synthetic_order_id} "
+                        f"error={error} pre_token_balance={pre_token_balance} "
+                        f"post_token_balance={token_balance} delta={delta_balance} raw={raw}"
+                    ),
+                    0.0,
+                ])
+
+                print(
+                    f"[BTC5M] BUY POST TIMEOUT RECONCILED {decision.outcome}: "
+                    f"token_balance={token_balance:.4f}, using filled_size={filled_size:.4f}"
+                )
+
+                return {
+                    "response": {
+                        "status": "unknown_post_timeout_reconciled_by_token_balance",
+                        "error": str(error),
+                        "token_balance": token_balance,
+                        "token_balance_raw": raw,
+                    },
+                    "order_id": synthetic_order_id,
+                    "fill": fill,
+                    "fill_state": fill["fill_state"],
+                    "token_id": token_id,
+                    "price": fallback_price,
+                    "limit_price": fallback_price,
+                    "size": filled_size,
+                    "requested_size": requested_size,
+                    "order_value": fallback_price * filled_size,
+                    "actual_buy_cost": fallback_price * filled_size,
+                    "actual_buy_shares": filled_size,
+                    "balance_info": "post_timeout_reconciled_by_conditional_token_balance",
+                    "token_balance_reconciliation": str(fill["raw"]),
+                }
+        except Exception as balance_error:
+            last_raw = str(balance_error)
+            print(f"[BTC5M] post-timeout token balance reconciliation attempt {attempt} failed: {balance_error}")
+
+    raise RuntimeError(
+        "Live BUY post request failed/uncertain and token-balance reconciliation did not find shares. "
+        f"error={error} pre_token_balance={pre_token_balance} "
+        f"last_token_balance={last_balance} last_raw={last_raw}"
+    )
+
+
 def ensure_live_balance_for_buy(price: float, size: float, client: Optional[V2ClobClient] = None) -> dict[str, Any]:
     client = client or get_live_client_v2()
     info = read_collateral_balance_allowance(client)
@@ -894,13 +1006,48 @@ def place_live_limit_buy(snapshot: dict[str, Any], decision: Any) -> dict[str, A
     client = get_live_client_v2()
     balance_info = ensure_live_balance_for_buy(price, size, client=client)
 
-    response = client.create_and_post_order(
-        order_args=V2OrderArgs(token_id=str(token_id), price=price, side=V2Side.BUY, size=size),
-        options=V2PartialCreateOrderOptions(tick_size="0.01"),
-        order_type=V2OrderType.GTC,
-    )
+    try:
+        pre_token_balance, _ = read_normalized_conditional_token_balance(client, str(token_id))
+    except Exception as e:
+        pre_token_balance = 0.0
+        print(f"[BTC5M] pre-buy token balance check failed for token={token_id}: {e}")
+
+    try:
+        response = client.create_and_post_order(
+            order_args=V2OrderArgs(token_id=str(token_id), price=price, side=V2Side.BUY, size=size),
+            options=V2PartialCreateOrderOptions(tick_size="0.01"),
+            order_type=V2OrderType.GTC,
+        )
+    except Exception as e:
+        return reconcile_buy_after_post_exception(
+            client=client,
+            snapshot=snapshot,
+            decision=decision,
+            token_id=str(token_id),
+            requested_size=size,
+            fallback_price=price,
+            pre_token_balance=pre_token_balance,
+            error=e,
+        )
+
     order_id = extract_order_id(response)
     if not order_id:
+        try:
+            post_token_balance, raw_balance = read_normalized_conditional_token_balance(client, str(token_id))
+        except Exception:
+            post_token_balance = pre_token_balance
+            raw_balance = None
+        if post_token_balance >= float(os.getenv("BTC_5M_MIN_FILLED_SIZE", "0.01")):
+            return reconcile_buy_after_post_exception(
+                client=client,
+                snapshot=snapshot,
+                decision=decision,
+                token_id=str(token_id),
+                requested_size=size,
+                fallback_price=price,
+                pre_token_balance=pre_token_balance,
+                error=RuntimeError(f"Live BUY posted but no order id found in response: {response}; balance_raw={raw_balance}"),
+            )
         raise RuntimeError(f"Live BUY posted but no order id found in response: {response}")
 
     log_trade([
