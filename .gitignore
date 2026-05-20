@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project files
+btc_5m_state.json
+btc_5m_decisions.csv
+btc_5m_trades.csv
+archive_*.csv
+archive_*.json
+__pycache__/
