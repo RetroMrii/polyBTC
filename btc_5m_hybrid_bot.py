@@ -107,6 +107,47 @@ def log_trade(row: list[Any]) -> None:
     with open(TRADES_FILE, "a", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow(row)
 
+def discord_alerts_enabled() -> bool:
+    return os.getenv("BTC_5M_DISCORD_ALERTS", "false").lower() == "true" and bool(
+        os.getenv("BTC_5M_DISCORD_WEBHOOK_URL")
+    )
+
+
+def fmt_money(value: Any) -> str:
+    try:
+        return f"${float(value):.4f}"
+    except Exception:
+        return str(value)
+
+
+def fmt_price(value: Any) -> str:
+    try:
+        return f"{float(value):.4f}"
+    except Exception:
+        return str(value)
+
+
+def send_discord_alert(message: str) -> None:
+    enabled = os.getenv("BTC_5M_DISCORD_ALERTS", "false").lower() == "true"
+    webhook_url = os.getenv("BTC_5M_DISCORD_WEBHOOK_URL")
+
+    if not enabled or not webhook_url:
+        return
+
+    try:
+        resp = HTTP_SESSION.post(
+            webhook_url,
+            json={"content": message[:1900]},
+            timeout=5,
+        )
+        if resp.status_code >= 300:
+            print(
+                f"[BTC5M] Discord alert failed "
+                f"status={resp.status_code} body={resp.text[:300]}"
+            )
+    except Exception as e:
+        print(f"[BTC5M] Discord alert error: {e}")
+
 def print_startup_config() -> None:
     keys = [
         "BTC_5M_MODE",
@@ -371,12 +412,16 @@ def reconcile_buy_after_post_exception(
             last_raw = raw
             delta_balance = max(0.0, token_balance - pre_token_balance)
 
-            if token_balance >= min_filled_size:
-                filled_size = min(token_balance, float(requested_size))
+            if delta_balance >= min_filled_size:
+                filled_size = min(delta_balance, float(requested_size))
                 fill = {
                     "status": "filled_by_token_balance_after_post_exception",
                     "filled_size": filled_size,
-                    "remaining_size": 0.0 if filled_size >= requested_size else max(0.0, requested_size - filled_size),
+                    "remaining_size": (
+                        0.0
+                        if filled_size >= requested_size
+                        else max(0.0, requested_size - filled_size)
+                    ),
                     "avg_fill_price": fallback_price,
                     "raw": {
                         "post_exception": str(error),
@@ -408,14 +453,19 @@ def reconcile_buy_after_post_exception(
 
                 print(
                     f"[BTC5M] BUY POST TIMEOUT RECONCILED {decision.outcome}: "
-                    f"token_balance={token_balance:.4f}, using filled_size={filled_size:.4f}"
+                    f"pre_balance={pre_token_balance:.4f}, "
+                    f"post_balance={token_balance:.4f}, "
+                    f"delta={delta_balance:.4f}, "
+                    f"using filled_size={filled_size:.4f}"
                 )
 
                 return {
                     "response": {
                         "status": "unknown_post_timeout_reconciled_by_token_balance",
                         "error": str(error),
-                        "token_balance": token_balance,
+                        "pre_token_balance": pre_token_balance,
+                        "post_token_balance": token_balance,
+                        "delta_token_balance": delta_balance,
                         "token_balance_raw": raw,
                     },
                     "order_id": synthetic_order_id,
@@ -1202,7 +1252,7 @@ def place_live_limit_buy(snapshot: dict[str, Any], decision: Any) -> dict[str, A
     }
 
 
-def place_live_limit_sell(position: dict[str, Any], exit_price: float) -> dict[str, Any]:
+def place_live_limit_sell(position: dict[str, Any], exit_price: float, size_override: Optional[float] = None) -> dict[str, Any]:
     if not live_mode_is_armed():
         raise RuntimeError(
             "Live sell blocked. Require BTC_5M_MODE=live, "
@@ -1210,7 +1260,7 @@ def place_live_limit_sell(position: dict[str, Any], exit_price: float) -> dict[s
         )
 
     price = float(exit_price)
-    size = float(position["size"])
+    size = float(size_override if size_override is not None else position["size"])
     token_id = position.get("token_id")
 
     if not token_id:
@@ -1301,74 +1351,203 @@ def place_live_limit_sell(position: dict[str, Any], exit_price: float) -> dict[s
     }
 
 
-def apply_live_partial_exit(
-    state: dict[str, Any],
-    market_id: str,
-    position: dict[str, Any],
-    outcome: str,
-    exit_price: float,
-    sold_size: float,
-    net_pnl: float,
-    close_reason: str,
-    reason_text: str,
-    live_result: dict[str, Any],
-    simulated: bool,
-) -> bool:
-    raw_remaining = live_result.get("remaining_token_balance")
-    if raw_remaining is None:
-        return False
 
-    try:
-        remaining_size = float(raw_remaining)
-    except Exception:
-        return False
-
-    min_leftover = float(os.getenv("BTC_5M_MIN_FILLED_SIZE", "0.01"))
-    if remaining_size < min_leftover:
-        return False
-
-    original_size = float(position.get("size", sold_size))
-    original_buy_cost = float(position.get("actual_buy_cost", float(position["entry_price"]) * original_size))
-    original_buy_shares = float(position.get("actual_buy_shares", original_size))
-
-    if original_buy_shares > 0:
-        sold_cost_basis = original_buy_cost * (sold_size / original_buy_shares)
-        remaining_cost_basis = max(0.0, original_buy_cost - sold_cost_basis)
-    else:
-        remaining_cost_basis = float(position["entry_price"]) * remaining_size
-
-    position["size"] = remaining_size
-    position["actual_buy_shares"] = remaining_size
-    position["actual_buy_cost"] = remaining_cost_basis
-    position["partial_exit_last_at"] = utc_now()
-    position["partial_exit_last_reason"] = close_reason
-    position["partial_exit_last_sold_size"] = sold_size
-    position["partial_exit_last_remaining_size"] = remaining_size
-    position["partial_exit_last_pnl"] = net_pnl
-    position["partial_exit_last_order_id"] = live_result.get("order_id")
-
-    state["daily_pnl"] = float(state.get("daily_pnl", 0.0)) + net_pnl
-    state["total_pnl"] = float(state.get("total_pnl", 0.0)) + net_pnl
-
-    log_trade([
-        utc_now(),
-        os.getenv("BTC_5M_MODE", "paper").lower(),
-        market_id,
-        "PARTIAL_EXIT",
-        outcome,
-        exit_price,
-        sold_size,
-        simulated,
-        reason_text + f" remaining_token_balance={remaining_size}",
-        net_pnl,
-    ])
-
-    print(
-        f"[BTC5M] PARTIAL_EXIT {outcome} sold={sold_size:.4f} "
-        f"remaining={remaining_size:.4f} net_after_buffer={net_pnl:.4f}"
+def get_position_expected_shares(position: dict[str, Any], fallback_size: float) -> float:
+    return float(
+        position.get("actual_buy_shares")
+        or position.get("size")
+        or fallback_size
     )
-    return True
 
+
+def get_live_token_balance_for_token(client: V2ClobClient, token_id: str) -> float:
+    info = read_conditional_balance_allowance(client, str(token_id))
+    return normalize_usdc_balance(float(info.get("balance", 0.0)))
+
+
+def get_exit_slippage_for_action(trade_action: str, net_pnl: float) -> float:
+    if trade_action == "STOPLOSS" or (trade_action == "TIME_EXIT" and net_pnl < 0):
+        return float(os.getenv("BTC_5M_STOPLOSS_EXIT_SLIPPAGE", "0.02"))
+    if trade_action == "PROTECT_EXIT":
+        return float(os.getenv("BTC_5M_PROTECT_EXIT_SLIPPAGE", "0.01"))
+    if trade_action == "CASHOUT":
+        return float(os.getenv("BTC_5M_CASHOUT_EXIT_SLIPPAGE", "0.01"))
+    if trade_action == "TRAIL_EXIT":
+        return float(os.getenv("BTC_5M_TRAIL_EXIT_SLIPPAGE", "0.01"))
+    return 0.0
+
+
+def full_live_exit_is_confirmed(
+    expected_exit_size: float,
+    total_sold_size: float,
+    remaining_token_balance: Optional[float],
+) -> tuple[bool, str]:
+    min_leftover = float(os.getenv("BTC_5M_MIN_FILLED_SIZE", "0.01"))
+
+    sold_all_by_fill = total_sold_size >= max(0.0, expected_exit_size - min_leftover)
+    sold_all_by_balance = (
+        remaining_token_balance is not None
+        and remaining_token_balance < min_leftover
+    )
+
+    if sold_all_by_fill:
+        return True, (
+            f"sold_all_by_fill expected_exit_size={expected_exit_size:.4f} "
+            f"total_sold_size={total_sold_size:.4f} "
+            f"remaining_token_balance={remaining_token_balance}"
+        )
+
+    if sold_all_by_balance:
+        return True, (
+            f"sold_all_by_balance expected_exit_size={expected_exit_size:.4f} "
+            f"total_sold_size={total_sold_size:.4f} "
+            f"remaining_token_balance={remaining_token_balance}"
+        )
+
+    return False, (
+        f"full_exit_not_confirmed expected_exit_size={expected_exit_size:.4f} "
+        f"total_sold_size={total_sold_size:.4f} "
+        f"remaining_token_balance={remaining_token_balance}"
+    )
+
+
+def place_live_limit_sell_all(
+    position: dict[str, Any],
+    snapshot_exit_price: float,
+    trade_action: str,
+    net_pnl: float,
+) -> dict[str, Any]:
+    """Try to liquidate the full live position.
+
+    This is intentionally not a partial-exit strategy. It repeatedly attempts to
+    sell the remaining known position until fill size or wallet balance confirms
+    the position is gone. If full liquidation cannot be confirmed, the caller
+    must mark the position for manual reconciliation.
+    """
+    if not live_mode_is_armed():
+        raise RuntimeError(
+            "Live sell blocked. Require BTC_5M_MODE=live, "
+            "BTC_5M_LIVE_ARMED=true, and BTC_5M_ALLOW_REAL_ORDERS=true."
+        )
+
+    token_id = position.get("token_id")
+    if not token_id:
+        raise RuntimeError("Cannot sell live position: missing token_id in position state")
+
+    client = get_live_client_v2()
+    min_leftover = float(os.getenv("BTC_5M_MIN_FILLED_SIZE", "0.01"))
+    max_attempts = max(1, int(os.getenv("BTC_5M_EXIT_MAX_ATTEMPTS", "3")))
+    retry_sleep = float(os.getenv("BTC_5M_EXIT_RETRY_SLEEP_SECONDS", "1"))
+    retry_slippage_step = float(os.getenv("BTC_5M_EXIT_RETRY_SLIPPAGE_STEP", "0.01"))
+    final_min_price = float(os.getenv("BTC_5M_EXIT_FINAL_MIN_PRICE", "0.01"))
+
+    expected_exit_size = get_position_expected_shares(position, float(position.get("size", 0.0)))
+
+    pre_exit_balance: Optional[float] = None
+    try:
+        pre_exit_balance = get_live_token_balance_for_token(client, str(token_id))
+        if pre_exit_balance > min_leftover:
+            # Do not try to sell more than wallet says is available.
+            expected_exit_size = min(expected_exit_size, pre_exit_balance)
+    except Exception as e:
+        print(f"[BTC5M] pre-exit token balance check failed for token={token_id}: {e}")
+
+    if expected_exit_size <= min_leftover:
+        raise RuntimeError(
+            f"Live SELL blocked: expected exit size too small. "
+            f"expected_exit_size={expected_exit_size:.4f} pre_exit_balance={pre_exit_balance}"
+        )
+
+    base_slippage = get_exit_slippage_for_action(trade_action, net_pnl)
+    total_sold_size = 0.0
+    total_sell_proceeds = 0.0
+    attempts: list[dict[str, Any]] = []
+    last_remaining_balance: Optional[float] = pre_exit_balance
+
+    for attempt in range(1, max_attempts + 1):
+        expected_remaining = max(0.0, expected_exit_size - total_sold_size)
+        if expected_remaining < min_leftover:
+            break
+
+        if attempt > 1:
+            time.sleep(retry_sleep)
+            try:
+                last_remaining_balance = get_live_token_balance_for_token(client, str(token_id))
+            except Exception as e:
+                print(f"[BTC5M] exit retry token balance check failed for token={token_id}: {e}")
+
+        if last_remaining_balance is not None and last_remaining_balance < min_leftover:
+            break
+
+        size_to_sell = expected_remaining
+        if last_remaining_balance is not None and last_remaining_balance > min_leftover:
+            size_to_sell = min(size_to_sell, last_remaining_balance)
+
+        if size_to_sell < min_leftover:
+            break
+
+        attempt_price = max(
+            final_min_price,
+            float(snapshot_exit_price) - base_slippage - ((attempt - 1) * retry_slippage_step),
+        )
+
+        result = place_live_limit_sell(position, attempt_price, size_override=size_to_sell)
+        result["attempt"] = attempt
+        result["attempt_price"] = attempt_price
+        result["attempt_size_requested"] = size_to_sell
+        attempts.append(result)
+
+        sold_size = float(result.get("actual_sell_shares") or result.get("size") or 0.0)
+        proceeds = float(result.get("actual_sell_proceeds", float(result.get("price", attempt_price)) * sold_size))
+
+        total_sold_size += sold_size
+        total_sell_proceeds += proceeds
+
+        raw_remaining = result.get("remaining_token_balance")
+        try:
+            last_remaining_balance = float(raw_remaining) if raw_remaining is not None else None
+        except Exception:
+            last_remaining_balance = None
+
+        exit_complete, _ = full_live_exit_is_confirmed(
+            expected_exit_size=expected_exit_size,
+            total_sold_size=total_sold_size,
+            remaining_token_balance=last_remaining_balance,
+        )
+        if exit_complete:
+            break
+
+    exit_complete, exit_confirm_reason = full_live_exit_is_confirmed(
+        expected_exit_size=expected_exit_size,
+        total_sold_size=total_sold_size,
+        remaining_token_balance=last_remaining_balance,
+    )
+
+    avg_exit_price = (
+        total_sell_proceeds / total_sold_size
+        if total_sold_size > 0
+        else float(snapshot_exit_price)
+    )
+
+    return {
+        "response": attempts[-1]["response"] if attempts else None,
+        "order_id": attempts[-1]["order_id"] if attempts else None,
+        "fill": attempts[-1]["fill"] if attempts else None,
+        "fill_state": attempts[-1]["fill_state"] if attempts else "no_fill",
+        "token_id": token_id,
+        "price": avg_exit_price,
+        "limit_price": attempts[-1]["limit_price"] if attempts else snapshot_exit_price,
+        "size": total_sold_size,
+        "actual_sell_proceeds": total_sell_proceeds,
+        "actual_sell_shares": total_sold_size,
+        "remaining_token_balance": last_remaining_balance,
+        "expected_exit_size": expected_exit_size,
+        "exit_complete": exit_complete,
+        "exit_confirm_reason": exit_confirm_reason,
+        "attempt_count": len(attempts),
+        "attempts": attempts,
+        "pre_exit_balance": pre_exit_balance,
+    }
 
 def settle_expired_positions(state: dict[str, Any]) -> None:
     open_positions = state.setdefault("open_positions", {})
@@ -1693,17 +1872,12 @@ def maybe_cashout_profitable_position(state: dict[str, Any], snapshot: dict[str,
 
     if mode == "live":
         try:
-            live_exit_price = exit_price
-            if trade_action == "STOPLOSS" or (trade_action == "TIME_EXIT" and net_pnl < 0):
-                live_exit_price = max(0.01, exit_price - float(os.getenv("BTC_5M_STOPLOSS_EXIT_SLIPPAGE", "0.02")))
-            elif trade_action == "PROTECT_EXIT":
-                live_exit_price = max(0.01, exit_price - float(os.getenv("BTC_5M_PROTECT_EXIT_SLIPPAGE", "0.01")))
-            elif trade_action == "CASHOUT":
-                live_exit_price = max(0.01, exit_price - float(os.getenv("BTC_5M_CASHOUT_EXIT_SLIPPAGE", "0.01")))
-            elif trade_action == "TRAIL_EXIT":
-                live_exit_price = max(0.01, exit_price - float(os.getenv("BTC_5M_TRAIL_EXIT_SLIPPAGE", "0.01")))
-
-            live_result = place_live_limit_sell(position, live_exit_price)
+            live_result = place_live_limit_sell_all(
+                position=position,
+                snapshot_exit_price=exit_price,
+                trade_action=trade_action,
+                net_pnl=net_pnl,
+            )
             live_response = live_result["response"]
             simulated = False
 
@@ -1713,8 +1887,8 @@ def maybe_cashout_profitable_position(state: dict[str, Any], snapshot: dict[str,
                 live_result.get("actual_sell_proceeds", actual_exit_price * actual_exit_size)
             )
 
-            position_buy_cost = float(position.get("actual_buy_cost", entry_price * position_size))
-            position_buy_shares = float(position.get("actual_buy_shares", position_size))
+            position_buy_shares = float(position.get("actual_buy_shares") or position_size)
+            position_buy_cost = float(position.get("actual_buy_cost") or (entry_price * position_buy_shares))
             cost_basis_for_sold_size = (
                 position_buy_cost * (actual_exit_size / position_buy_shares)
                 if position_buy_shares > 0
@@ -1739,8 +1913,8 @@ def maybe_cashout_profitable_position(state: dict[str, Any], snapshot: dict[str,
                     position["reconcile_balance_check_error"] = str(balance_error)
 
                 if 0 <= token_balance < float(os.getenv("BTC_5M_MIN_FILLED_SIZE", "0.01")):
-                    actual_buy_cost = float(position.get("actual_buy_cost", entry_price * float(position["size"])))
-                    actual_buy_shares = float(position.get("actual_buy_shares", position.get("size", position_size)))
+                    actual_buy_shares = float(position.get("actual_buy_shares") or position.get("size") or position_size)
+                    actual_buy_cost = float(position.get("actual_buy_cost") or (entry_price * actual_buy_shares))
                     estimated_sell_proceeds = exit_price * actual_buy_shares
                     gross_pnl = estimated_sell_proceeds - actual_buy_cost
                     fee_buffer_cost = extra_fee_buffer * actual_buy_shares
@@ -1786,6 +1960,15 @@ def maybe_cashout_profitable_position(state: dict[str, Any], snapshot: dict[str,
                         f"[BTC5M] RECONCILED_EXIT {outcome} token balance is zero; "
                         f"closing local state. estimated_net={net_pnl:.4f}"
                     )
+                    send_discord_alert(
+                        "🟠 **BTC5M RECONCILED EXIT**\n"
+                        f"Market: {snapshot.get('question')}\n"
+                        f"Outcome: **{outcome}**\n"
+                        f"Estimated exit: {fmt_price(exit_price)}\n"
+                        f"Size: {float(actual_buy_shares):.4f}\n"
+                        f"Estimated net PnL: **{fmt_money(net_pnl)}**\n"
+                        "Reason: token balance was zero after sell error; local state closed."
+                    )
                     return True
 
                 position["reconcile_required"] = True
@@ -1814,24 +1997,57 @@ def maybe_cashout_profitable_position(state: dict[str, Any], snapshot: dict[str,
             f"actual_buy_cost={position.get('actual_buy_cost')} "
             f"actual_buy_shares={position.get('actual_buy_shares')} "
             f"remaining_token_balance={live_result.get('remaining_token_balance')} "
+            f"expected_exit_size={live_result.get('expected_exit_size')} "
+            f"exit_complete={live_result.get('exit_complete')} "
+            f"exit_confirm_reason={live_result.get('exit_confirm_reason')} "
+            f"exit_attempt_count={live_result.get('attempt_count')} "
             f"exit_order_id={live_result.get('order_id')} "
             f"exit_fill_state={live_result.get('fill_state')} "
             f"live_response={live_response}"
         )
 
-    if live_result is not None and apply_live_partial_exit(
-        state=state,
-        market_id=market_id,
-        position=position,
-        outcome=outcome,
-        exit_price=exit_price,
-        sold_size=position_size,
-        net_pnl=net_pnl,
-        close_reason=close_reason,
-        reason_text=reason_text,
-        live_result=live_result,
-        simulated=simulated,
-    ):
+    if mode == "live" and live_result is not None and not bool(live_result.get("exit_complete", True)):
+        exit_confirm_reason = str(live_result.get("exit_confirm_reason", "full_exit_not_confirmed"))
+        position["reconcile_required"] = True
+        position["reconcile_reason"] = exit_confirm_reason
+        position["reconcile_at"] = utc_now()
+        position["exit_incomplete_last_at"] = utc_now()
+        position["exit_incomplete_action"] = trade_action
+        position["exit_incomplete_close_reason"] = close_reason
+        position["exit_incomplete_sold_size"] = position_size
+        position["exit_incomplete_expected_size"] = live_result.get("expected_exit_size")
+        position["exit_incomplete_remaining_token_balance"] = live_result.get("remaining_token_balance")
+        position["exit_incomplete_exit_price"] = exit_price
+        position["exit_incomplete_estimated_net_pnl"] = net_pnl
+        position["exit_incomplete_live_result"] = str(live_result)
+
+        log_trade([
+            utc_now(),
+            mode,
+            market_id,
+            "EXIT_INCOMPLETE",
+            outcome,
+            exit_price,
+            position_size,
+            simulated,
+            reason_text + " " + exit_confirm_reason,
+            net_pnl,
+        ])
+
+        print(
+            f"[BTC5M] EXIT_INCOMPLETE {outcome}: sold={position_size:.4f}, "
+            f"reason={exit_confirm_reason}. Manual reconciliation required."
+        )
+        send_discord_alert(
+            "🚨 **BTC5M EXIT INCOMPLETE**\n"
+            f"Market: {snapshot.get('question')}\n"
+            f"Outcome: **{outcome}**\n"
+            f"Sold size: {float(position_size):.4f}\n"
+            f"Exit: {fmt_price(exit_price)}\n"
+            f"Net PnL on sold amount: **{fmt_money(net_pnl)}**\n"
+            f"Reason: {exit_confirm_reason}\n"
+            "Action required: check Polymarket UI immediately."
+        )
         return True
 
     state["daily_pnl"] = float(state.get("daily_pnl", 0.0)) + net_pnl
@@ -1852,6 +2068,21 @@ def maybe_cashout_profitable_position(state: dict[str, Any], snapshot: dict[str,
     print(
         f"[BTC5M] {trade_action} {outcome} entry={entry_price} exit={exit_price} "
         f"gross={gross_pnl:.4f} net_after_buffer={net_pnl:.4f}"
+    )
+    emoji = "🟢" if net_pnl > 0 else "🔴" if net_pnl < 0 else "⚪"
+
+    send_discord_alert(
+        f"{emoji} **BTC5M {trade_action}**\n"
+        f"Market: {snapshot.get('question')}\n"
+        f"Outcome: **{outcome}**\n"
+        f"Entry: {fmt_price(entry_price)}\n"
+        f"Exit: {fmt_price(exit_price)}\n"
+        f"Size: {float(position_size):.4f}\n"
+        f"Gross PnL: {fmt_money(gross_pnl)}\n"
+        f"Net PnL: **{fmt_money(net_pnl)}**\n"
+        f"Reason: {close_reason}\n"
+        f"BTC: {snapshot.get('btc_price')} | Strike: {strike}\n"
+        f"Time left: {seconds_to_expiry}s"
     )
 
     closed_markets[market_id] = {
@@ -2174,6 +2405,18 @@ def main() -> None:
                         f"[BTC5M] LIVE BUY {decision.outcome} @ {live_result['price']} "
                         f"size={live_result['size']} value={live_result['order_value']:.4f}"
                     )
+                    send_discord_alert(
+                        "🟢 **BTC5M LIVE BUY**\n"
+                        f"Market: {snapshot.get('question')}\n"
+                        f"Outcome: **{decision.outcome}**\n"
+                        f"Entry: {fmt_price(live_result['price'])}\n"
+                        f"Size: {float(live_result['size']):.4f}\n"
+                        f"Value: {fmt_money(live_result['order_value'])}\n"
+                        f"BTC: {snapshot.get('btc_price')} | Strike: {snapshot.get('strike')}\n"
+                        f"Time left: {snapshot.get('seconds_to_expiry')}s\n"
+                        f"Reason: {decision.reason}\n"
+                        f"Order: `{live_result['order_id']}`"
+                    )
                 except Exception as e:
                     error_text = str(e)
                     print(f"[BTC5M] LIVE ORDER BLOCKED/FAILED: {error_text}")
@@ -2223,6 +2466,12 @@ def main() -> None:
                     print(
                         "[BTC5M] WARNING: live order failed/uncertain after post attempt. "
                         "Check Polymarket UI immediately before continuing."
+                    )
+                    send_discord_alert(
+                        "🚨 **BTC5M LIVE ORDER UNCERTAIN**\n"
+                        f"Market: {snapshot.get('question')}\n"
+                        f"Error: `{error_text[:500]}`\n"
+                        "Action required: check Polymarket UI immediately."
                     )
 
                     state.setdefault("closed_markets", {})[market_id] = {

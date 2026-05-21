@@ -13,7 +13,6 @@ CLOSED_ACTIONS = {
     "TIME_EXIT",
     "TRAIL_EXIT",
     "PROTECT_EXIT",
-    "PARTIAL_EXIT",
     "RECONCILED_EXIT",
     "SETTLE",
 }
@@ -134,6 +133,7 @@ def print_summary(rows: list[dict[str, Any]], title: str) -> None:
     filled_buys = [row for row in rows if row.get("side") == "BUY"]
     unfilled = [row for row in rows if row.get("side") in UNFILLED_ACTIONS]
     exits_posted = [row for row in rows if row.get("side") == "EXIT_ORDER_POSTED"]
+    exit_incomplete = [row for row in rows if row.get("side") == "EXIT_INCOMPLETE"]
 
     print()
     print("Execution:")
@@ -141,6 +141,7 @@ def print_summary(rows: list[dict[str, Any]], title: str) -> None:
     print("  BUY filled:", len(filled_buys))
     print("  ORDER_UNFILLED_CANCELLED:", len(unfilled))
     print("  EXIT_ORDER_POSTED:", len(exits_posted))
+    print("  EXIT_INCOMPLETE:", len(exit_incomplete))
     print("  Fill rate:", round(len(filled_buys) / len(posted) * 100, 2) if posted else 0, "%")
 
 
