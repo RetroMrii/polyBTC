@@ -200,6 +200,16 @@ def print_startup_config() -> None:
         "BTC_5M_TRAIL_FORCE_CASHOUT_NET",
         "BTC_5M_PREVENT_REENTRY_AFTER_CASHOUT",
         "BTC_5M_RECONCILE_ON_STARTUP",
+        "BTC_5M_POST_TIMEOUT_RECONCILE_ATTEMPTS",
+        "BTC_5M_POST_TIMEOUT_RECONCILE_SLEEP_SECONDS",
+        "BTC_5M_EXIT_MAX_ATTEMPTS",
+        "BTC_5M_EXIT_RETRY_SLEEP_SECONDS",
+        "BTC_5M_EXIT_RETRY_SLIPPAGE_STEP",
+        "BTC_5M_EXIT_FINAL_MIN_PRICE",
+        "BTC_5M_ORDER_STATUS_POLL_SECONDS",
+        "BTC_5M_MIN_FILLED_SIZE",
+        "BTC_5M_CANCEL_STALE_ORDERS",
+        "BTC_5M_DISCORD_ALERTS",
     ]
 
     print("[BTC5M] active config:")
@@ -352,6 +362,19 @@ def read_conditional_balance_allowance(client: V2ClobClient, token_id: str) -> d
 def normalize_usdc_balance(raw_balance: float) -> float:
     return raw_balance / 1_000_000 if raw_balance > 10_000 else raw_balance
 
+def normalize_conditional_token_balance(raw_balance: float) -> float:
+    value = float(raw_balance)
+
+    if value <= 0:
+        return 0.0
+
+    # Conditional token balances are commonly returned in 1e6 raw units.
+    # For this bot, real positions are small, usually under 10 shares.
+    # Values like 4139 mean 0.004139 shares, not 4139 shares.
+    if value > 100:
+        return value / 1_000_000
+
+    return value
 
 def is_zero_token_balance_error(error_text: str) -> bool:
     text = str(error_text).lower()
@@ -369,14 +392,14 @@ def get_live_token_balance_for_position(position: dict[str, Any]) -> float:
 
     client = get_live_client_v2()
     info = read_conditional_balance_allowance(client, str(token_id))
-    return normalize_usdc_balance(float(info.get("balance", 0.0)))
+    return normalize_conditional_token_balance(float(info.get("balance", 0.0)))
 
 
 
 
 def read_normalized_conditional_token_balance(client: V2ClobClient, token_id: str) -> tuple[float, Any]:
     info = read_conditional_balance_allowance(client, str(token_id))
-    return normalize_usdc_balance(float(info.get("balance", 0.0))), info.get("raw")
+    return normalize_conditional_token_balance(float(info.get("balance", 0.0))), info.get("raw")
 
 
 def reconcile_buy_after_post_exception(
@@ -396,7 +419,7 @@ def reconcile_buy_after_post_exception(
     polls token balance briefly; if balance increased, it returns a synthetic filled BUY
     result so the bot can manage the live position instead of forcing manual rescue.
     """
-    attempts = int(os.getenv("BTC_5M_POST_TIMEOUT_RECONCILE_ATTEMPTS", "4"))
+    attempts = int(os.getenv("BTC_5M_POST_TIMEOUT_RECONCILE_ATTEMPTS", "12"))
     sleep_seconds = float(os.getenv("BTC_5M_POST_TIMEOUT_RECONCILE_SLEEP_SECONDS", "1"))
     min_filled_size = float(os.getenv("BTC_5M_MIN_FILLED_SIZE", "0.01"))
 
@@ -486,10 +509,18 @@ def reconcile_buy_after_post_exception(
             last_raw = str(balance_error)
             print(f"[BTC5M] post-timeout token balance reconciliation attempt {attempt} failed: {balance_error}")
 
+    cancelled_order_ids = cancel_matching_open_buy_after_post_timeout(
+        client=client,
+        market_id=str(snapshot["market_id"]),
+        token_id=str(token_id),
+    )
+
+
     raise RuntimeError(
         "Live BUY post request failed/uncertain and token-balance reconciliation did not find shares. "
         f"error={error} pre_token_balance={pre_token_balance} "
-        f"last_token_balance={last_balance} last_raw={last_raw}"
+        f"last_token_balance={last_balance} last_raw={last_raw} "
+        f"cancelled_matching_open_buy_orders={cancelled_order_ids}"
     )
 
 
@@ -502,28 +533,34 @@ def ensure_live_balance_for_buy(price: float, size: float, client: Optional[V2Cl
     allowance = float(info["allowance"])
 
     if balance <= 0:
-        raise RuntimeError(f"Live BUY blocked: collateral balance appears zero. raw={info['raw']}")
+        raise LiveOrderPreCheckBlocked(f"Live BUY blocked: collateral balance appears zero. raw={info['raw']}")
     if balance < required:
-        raise RuntimeError(
+        raise LiveOrderPreCheckBlocked(
             f"Live BUY blocked: insufficient collateral balance. "
             f"required={required:.4f}, balance={balance:.4f}, raw={info['raw']}"
         )
     if allowance <= 0:
-        raise RuntimeError(f"Live BUY blocked: collateral allowance appears zero. raw={info['raw']}")
+        raise LiveOrderPreCheckBlocked(
+            f"Live BUY blocked: collateral allowance appears zero. raw={info['raw']}"
+        )
 
     return info
 
 
-def ensure_live_balance_for_sell(position: dict[str, Any], client: Optional[V2ClobClient] = None) -> dict[str, Any]:
+def ensure_live_balance_for_sell(
+    position: dict[str, Any],
+    client: Optional[V2ClobClient] = None,
+    size_override: Optional[float] = None,
+) -> dict[str, Any]:
     client = client or get_live_client_v2()
     token_id = position.get("token_id")
-    size = float(position["size"])
+    size = float(size_override if size_override is not None else position["size"])
 
     if not token_id:
         raise RuntimeError("Live SELL blocked: missing token_id")
 
     info = read_conditional_balance_allowance(client, str(token_id))
-    balance = normalize_usdc_balance(float(info["balance"]))
+    balance = normalize_conditional_token_balance(float(info["balance"]))
     allowance = float(info["allowance"])
 
     if balance < size:
@@ -839,7 +876,9 @@ def verify_post_cancel_buy_fill(
     # If get_order is stale/incomplete, check actual conditional token balance.
     try:
         info = read_conditional_balance_allowance(client, str(token_id))
-        token_balance = normalize_usdc_balance(float(info.get("balance", 0.0)))
+        token_balance = normalize_conditional_token_balance(
+            float(info.get("balance", 0.0))
+        )
 
         if token_balance > 0:
             return {
@@ -868,7 +907,9 @@ def reconcile_buy_fill_with_token_balance(
 ) -> dict[str, Any]:
     try:
         info = read_conditional_balance_allowance(client, str(token_id))
-        token_balance = normalize_usdc_balance(float(info.get("balance", 0.0)))
+        token_balance = normalize_conditional_token_balance(
+            float(info.get("balance", 0.0))
+        )
 
         if token_balance > reported_filled_size:
             return {
@@ -936,6 +977,76 @@ def get_open_orders_safe(client: V2ClobClient) -> list[Any]:
         return orders
     return []
 
+def order_matches_market_token_side(
+    order: Any,
+    market_id: str,
+    token_id: str,
+    side: str,
+) -> bool:
+    raw = order if isinstance(order, dict) else getattr(order, "__dict__", {})
+
+    if not isinstance(raw, dict):
+        raw = {}
+
+    raw_market = str(
+        raw.get("market")
+        or raw.get("market_id")
+        or raw.get("condition_id")
+        or raw.get("conditionId")
+        or ""
+    )
+
+    raw_token = str(
+        raw.get("asset_id")
+        or raw.get("assetId")
+        or raw.get("token_id")
+        or raw.get("tokenId")
+        or ""
+    )
+
+    raw_side = str(raw.get("side") or "").upper()
+
+    return (
+        raw_market.lower() == str(market_id).lower()
+        and raw_token == str(token_id)
+        and raw_side == str(side).upper()
+    )
+
+
+def cancel_matching_open_buy_after_post_timeout(
+    client: V2ClobClient,
+    market_id: str,
+    token_id: str,
+) -> list[str]:
+    cancelled_order_ids: list[str] = []
+
+    try:
+        open_orders = get_open_orders_safe(client)
+    except Exception as e:
+        print(f"[BTC5M] post-timeout open-order query failed: {e}")
+        return cancelled_order_ids
+
+    for order in open_orders:
+        normalized = normalize_open_order(order)
+        order_id = normalized.get("id")
+
+        if not order_id:
+            continue
+
+        raw = normalized.get("raw")
+        if not order_matches_market_token_side(raw, market_id, token_id, "BUY"):
+            continue
+
+        if cancel_order_safe(client, str(order_id)):
+            cancelled_order_ids.append(str(order_id))
+
+    if cancelled_order_ids:
+        print(
+            f"[BTC5M] post-timeout cancelled matching open BUY orders: "
+            f"{cancelled_order_ids}"
+        )
+
+    return cancelled_order_ids
 
 def reconcile_live_state_on_startup(state: dict[str, Any]) -> dict[str, Any]:
     should_reconcile = os.getenv("BTC_5M_RECONCILE_ON_STARTUP", "true").lower() == "true"
@@ -1021,7 +1132,7 @@ def calculate_live_buy_size(price: float, decision_size: float) -> tuple[float, 
     order_value = price * size
 
     if order_value > max_order_value:
-        raise RuntimeError(
+        raise LiveOrderPreCheckBlocked(
             f"Live order blocked by max value: order_value={order_value:.4f}, limit={max_order_value:.4f}"
         )
     return size, order_value
@@ -1087,7 +1198,11 @@ def place_live_limit_buy(snapshot: dict[str, Any], decision: Any) -> dict[str, A
         except Exception:
             post_token_balance = pre_token_balance
             raw_balance = None
-        if post_token_balance >= float(os.getenv("BTC_5M_MIN_FILLED_SIZE", "0.01")):
+
+        post_delta_balance = max(0.0, post_token_balance - pre_token_balance)
+        min_filled_size = float(os.getenv("BTC_5M_MIN_FILLED_SIZE", "0.01"))
+
+        if post_delta_balance >= min_filled_size:
             return reconcile_buy_after_post_exception(
                 client=client,
                 snapshot=snapshot,
@@ -1096,9 +1211,22 @@ def place_live_limit_buy(snapshot: dict[str, Any], decision: Any) -> dict[str, A
                 requested_size=size,
                 fallback_price=price,
                 pre_token_balance=pre_token_balance,
-                error=RuntimeError(f"Live BUY posted but no order id found in response: {response}; balance_raw={raw_balance}"),
+                error=RuntimeError(
+                    f"Live BUY posted but no order id found in response: {response}; "
+                    f"pre_token_balance={pre_token_balance} "
+                    f"post_token_balance={post_token_balance} "
+                    f"delta={post_delta_balance} "
+                    f"balance_raw={raw_balance}"
+                ),
             )
-        raise RuntimeError(f"Live BUY posted but no order id found in response: {response}")
+
+        raise RuntimeError(
+            f"Live BUY posted but no order id found in response: {response}; "
+            f"pre_token_balance={pre_token_balance} "
+            f"post_token_balance={post_token_balance} "
+            f"delta={post_delta_balance} "
+            f"balance_raw={raw_balance}"
+        )
 
     log_trade([
         utc_now(),
@@ -1271,7 +1399,9 @@ def place_live_limit_sell(position: dict[str, Any], exit_price: float, size_over
         raise RuntimeError(f"Invalid live sell size: {size}")
 
     client = get_live_client_v2()
-    balance_info = ensure_live_balance_for_sell(position, client=client)
+    balance_info = ensure_live_balance_for_sell(
+        position, client=client, size_override=size
+    )
 
     response = client.create_and_post_order(
         order_args=V2OrderArgs(token_id=str(token_id), price=price, side=V2Side.SELL, size=size),
@@ -1331,7 +1461,9 @@ def place_live_limit_sell(position: dict[str, Any], exit_price: float, size_over
     remaining_token_balance = None
     try:
         post_sell_info = read_conditional_balance_allowance(client, str(token_id))
-        remaining_token_balance = normalize_usdc_balance(float(post_sell_info.get("balance", 0.0)))
+        remaining_token_balance = normalize_conditional_token_balance(
+            float(post_sell_info.get("balance", 0.0))
+        )
     except Exception as e:
         print(f"[BTC5M] post-sell token balance check failed for token={token_id}: {e}")
 
@@ -1362,7 +1494,7 @@ def get_position_expected_shares(position: dict[str, Any], fallback_size: float)
 
 def get_live_token_balance_for_token(client: V2ClobClient, token_id: str) -> float:
     info = read_conditional_balance_allowance(client, str(token_id))
-    return normalize_usdc_balance(float(info.get("balance", 0.0)))
+    return normalize_conditional_token_balance(float(info.get("balance", 0.0)))
 
 
 def get_exit_slippage_for_action(trade_action: str, net_pnl: float) -> float:
@@ -1446,16 +1578,25 @@ def place_live_limit_sell_all(
     pre_exit_balance: Optional[float] = None
     try:
         pre_exit_balance = get_live_token_balance_for_token(client, str(token_id))
-        if pre_exit_balance > min_leftover:
-            # Do not try to sell more than wallet says is available.
-            expected_exit_size = min(expected_exit_size, pre_exit_balance)
+
+        if pre_exit_balance < min_leftover:
+            raise RuntimeError(
+                "not enough balance / allowance: conditional token balance is dust or zero "
+                f"-> balance: {pre_exit_balance:.8f}, expected_exit_size: {expected_exit_size:.4f}"
+            )
+
+        # Do not try to sell more than wallet says is available.
+        expected_exit_size = min(expected_exit_size, pre_exit_balance)
+
+    except RuntimeError:
+        raise
     except Exception as e:
         print(f"[BTC5M] pre-exit token balance check failed for token={token_id}: {e}")
 
     if expected_exit_size <= min_leftover:
         raise RuntimeError(
-            f"Live SELL blocked: expected exit size too small. "
-            f"expected_exit_size={expected_exit_size:.4f} pre_exit_balance={pre_exit_balance}"
+            "not enough balance / allowance: expected exit size too small "
+            f"-> expected_exit_size={expected_exit_size:.4f}, pre_exit_balance={pre_exit_balance}"
         )
 
     base_slippage = get_exit_slippage_for_action(trade_action, net_pnl)
