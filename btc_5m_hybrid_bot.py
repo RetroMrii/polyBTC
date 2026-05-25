@@ -376,6 +376,27 @@ def normalize_conditional_token_balance(raw_balance: float) -> float:
 
     return value
 
+def estimate_taker_fee_usdc(size: float, price: float) -> float:
+    if os.getenv("BTC_5M_USE_DYNAMIC_FEE_BUFFER", "true").lower() != "true":
+        return 0.0
+
+    fee_rate = float(os.getenv("BTC_5M_TAKER_FEE_RATE", "0.07"))
+    p = max(0.0, min(1.0, float(price)))
+    shares = max(0.0, float(size))
+
+    return shares * fee_rate * p * (1.0 - p)
+
+
+def estimate_roundtrip_fee_buffer(entry_price: float, exit_price: float, size: float) -> float:
+    if os.getenv("BTC_5M_USE_DYNAMIC_FEE_BUFFER", "true").lower() == "true":
+        return (
+            estimate_taker_fee_usdc(size, entry_price)
+            + estimate_taker_fee_usdc(size, exit_price)
+        )
+
+    extra_fee_buffer = float(os.getenv("BTC_5M_EXTRA_FEE_BUFFER", "0.01"))
+    return extra_fee_buffer * float(size)
+
 def is_zero_token_balance_error(error_text: str) -> bool:
     text = str(error_text).lower()
     return (
@@ -1822,7 +1843,6 @@ def maybe_cashout_profitable_position(state: dict[str, Any], snapshot: dict[str,
 
     exit_price = float(exit_price_raw)
     min_net_profit = float(os.getenv("BTC_5M_MIN_NET_PROFIT", "0.02"))
-    extra_fee_buffer = float(os.getenv("BTC_5M_EXTRA_FEE_BUFFER", "0.01"))
     max_net_loss = float(os.getenv("BTC_5M_MAX_NET_LOSS", "0.75"))
     hard_max_net_loss = float(os.getenv("BTC_5M_HARD_MAX_NET_LOSS", "0"))
     enable_stoploss = os.getenv("BTC_5M_ENABLE_STOPLOSS", "true").lower() == "true"
@@ -1855,7 +1875,7 @@ def maybe_cashout_profitable_position(state: dict[str, Any], snapshot: dict[str,
     trail_force_cashout_net = float(os.getenv("BTC_5M_TRAIL_FORCE_CASHOUT_NET", "0.90"))
 
     gross_pnl = (exit_price - entry_price) * position_size
-    fee_buffer_cost = extra_fee_buffer * position_size
+    fee_buffer_cost = estimate_roundtrip_fee_buffer(entry_price, exit_price, position_size)
     net_pnl = gross_pnl - fee_buffer_cost
 
     btc_price = float(snapshot["btc_price"])
@@ -2037,7 +2057,7 @@ def maybe_cashout_profitable_position(state: dict[str, Any], snapshot: dict[str,
             )
 
             gross_pnl = actual_sell_proceeds - cost_basis_for_sold_size
-            fee_buffer_cost = extra_fee_buffer * actual_exit_size
+            fee_buffer_cost = estimate_roundtrip_fee_buffer(entry_price, actual_exit_price, actual_exit_size)
             net_pnl = gross_pnl - fee_buffer_cost
             exit_price = actual_exit_price
             position_size = actual_exit_size
@@ -2058,7 +2078,7 @@ def maybe_cashout_profitable_position(state: dict[str, Any], snapshot: dict[str,
                     actual_buy_cost = float(position.get("actual_buy_cost") or (entry_price * actual_buy_shares))
                     estimated_sell_proceeds = exit_price * actual_buy_shares
                     gross_pnl = estimated_sell_proceeds - actual_buy_cost
-                    fee_buffer_cost = extra_fee_buffer * actual_buy_shares
+                    fee_buffer_cost = estimate_roundtrip_fee_buffer(entry_price, exit_price, actual_buy_shares)
                     net_pnl = gross_pnl - fee_buffer_cost
 
                     state["daily_pnl"] = float(state.get("daily_pnl", 0.0)) + net_pnl
