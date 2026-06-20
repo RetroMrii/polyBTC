@@ -55,6 +55,7 @@ def load_state() -> dict[str, Any]:
             "live_blocked_orders": {},
             "live_unfilled_cancelled_orders": {},
             "live_reconciliation": {},
+            "entry_confirmation_candidates": {},
             "daily_pnl": 0.0,
             "total_pnl": 0.0,
             "last_market_id": None,
@@ -70,6 +71,7 @@ def load_state() -> dict[str, Any]:
     state.setdefault("live_blocked_orders", {})
     state.setdefault("live_unfilled_cancelled_orders", {})
     state.setdefault("live_reconciliation", {})
+    state.setdefault("entry_confirmation_candidates", {})
     state.setdefault("daily_pnl", 0.0)
     state.setdefault("total_pnl", 0.0)
     state.setdefault("last_market_id", None)
@@ -82,6 +84,124 @@ def save_state(state: dict[str, Any]) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
+
+
+def entry_confirmation_enabled() -> bool:
+    return os.getenv("BTC_5M_ENABLE_ENTRY_CONFIRMATION", "false").lower() == "true"
+
+
+def clear_entry_confirmation_for_market(state: dict[str, Any], market_id: str) -> None:
+    candidates = state.setdefault("entry_confirmation_candidates", {})
+    prefix = f"{market_id}:"
+
+    for key in list(candidates.keys()):
+        if str(key).startswith(prefix):
+            candidates.pop(key, None)
+
+
+def prune_stale_entry_confirmations(state: dict[str, Any]) -> None:
+    candidates = state.setdefault("entry_confirmation_candidates", {})
+    max_age = float(os.getenv("BTC_5M_ENTRY_CONFIRMATION_MAX_AGE_SECONDS", "20"))
+    now_epoch = time.time()
+
+    for key, candidate in list(candidates.items()):
+        try:
+            last_seen = float(candidate.get("last_seen_epoch", 0.0))
+        except Exception:
+            last_seen = 0.0
+
+        if now_epoch - last_seen > max_age * 3:
+            candidates.pop(key, None)
+
+
+def entry_signal_confirmed(state: dict[str, Any], snapshot: dict[str, Any], decision: Any) -> bool:
+    """Require repeated BUY signal before placing an order.
+
+    This is designed to filter one-loop edge spikes caused by stale/dislocated books.
+    Confirmation key is market + outcome. A non-BUY decision clears the current market's
+    candidates elsewhere in the main loop.
+    """
+    if not entry_confirmation_enabled():
+        return True
+
+    required = max(1, int(os.getenv("BTC_5M_ENTRY_CONFIRMATION_REQUIRED", "2")))
+    if required <= 1:
+        return True
+
+    market_id = str(snapshot.get("market_id", ""))
+    outcome = str(decision.outcome)
+    reason = str(decision.reason)
+    key = f"{market_id}:{outcome}"
+    now_epoch = time.time()
+    now_iso = utc_now()
+
+    max_age = float(os.getenv("BTC_5M_ENTRY_CONFIRMATION_MAX_AGE_SECONDS", "20"))
+    require_same_reason = (
+        os.getenv("BTC_5M_ENTRY_CONFIRMATION_REQUIRE_SAME_REASON", "false").lower() == "true"
+    )
+
+    candidates = state.setdefault("entry_confirmation_candidates", {})
+    prune_stale_entry_confirmations(state)
+
+    # Only keep one candidate per active market. If YES flips to NO, or NO flips to YES,
+    # the previous candidate is invalidated.
+    for existing_key in list(candidates.keys()):
+        if existing_key.startswith(f"{market_id}:") and existing_key != key:
+            candidates.pop(existing_key, None)
+
+    previous = candidates.get(key)
+    previous_count = 0
+    previous_first_seen = now_iso
+    previous_reason = None
+    previous_last_seen_epoch = 0.0
+
+    if isinstance(previous, dict):
+        previous_count = int(previous.get("count", 0) or 0)
+        previous_first_seen = str(previous.get("first_seen", now_iso))
+        previous_reason = previous.get("reason")
+        try:
+            previous_last_seen_epoch = float(previous.get("last_seen_epoch", 0.0))
+        except Exception:
+            previous_last_seen_epoch = 0.0
+
+    still_fresh = previous_last_seen_epoch > 0 and (now_epoch - previous_last_seen_epoch) <= max_age
+    same_reason_ok = (not require_same_reason) or previous_reason == reason
+
+    if previous and still_fresh and same_reason_ok:
+        count = previous_count + 1
+        first_seen = previous_first_seen
+    else:
+        count = 1
+        first_seen = now_iso
+
+    candidates[key] = {
+        "market_id": market_id,
+        "outcome": outcome,
+        "reason": reason,
+        "count": count,
+        "required": required,
+        "first_seen": first_seen,
+        "last_seen": now_iso,
+        "last_seen_epoch": now_epoch,
+        "first_edge": previous.get("first_edge") if isinstance(previous, dict) else decision.edge,
+        "last_edge": decision.edge,
+        "last_price": decision.price,
+        "seconds_to_expiry": snapshot.get("seconds_to_expiry"),
+    }
+
+    if count >= required:
+        candidates.pop(key, None)
+        print(
+            f"[BTC5M] ENTRY_CONFIRMATION passed {outcome}: "
+            f"count={count}/{required} market={market_id} edge={decision.edge}"
+        )
+        return True
+
+    print(
+        f"[BTC5M] ENTRY_CONFIRMATION waiting {outcome}: "
+        f"count={count}/{required} market={market_id} edge={decision.edge} reason={reason}"
+    )
+    return False
 
 def log_decision(row: list[Any]) -> None:
     with open(DECISIONS_FILE, "a", newline="", encoding="utf-8") as f:
@@ -2456,6 +2576,7 @@ def main() -> None:
             ])
 
             if decision.action != "BUY":
+                clear_entry_confirmation_for_market(state, str(snapshot.get("market_id", "")))
                 print(f"[BTC5M] {decision.action} reason={decision.reason} edge={decision.edge}")
                 save_state(state)
                 time.sleep(loop_seconds)
@@ -2489,6 +2610,11 @@ def main() -> None:
                 continue
 
             if market_id in open_positions:
+                save_state(state)
+                time.sleep(loop_seconds)
+                continue
+
+            if not entry_signal_confirmed(state, snapshot, decision):
                 save_state(state)
                 time.sleep(loop_seconds)
                 continue
