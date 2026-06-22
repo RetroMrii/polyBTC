@@ -45,6 +45,52 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def utc_today() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def infer_daily_pnl_date_from_state(state: dict[str, Any]) -> str:
+    last_updated = state.get("last_updated")
+
+    if isinstance(last_updated, str) and last_updated:
+        try:
+            return datetime.fromisoformat(last_updated.replace("Z", "+00:00")).date().isoformat()
+        except Exception:
+            pass
+
+    return utc_today()
+
+
+def reset_daily_pnl_if_needed(state: dict[str, Any]) -> bool:
+    today = utc_today()
+    stored_day = state.get("daily_pnl_date_utc")
+
+    if not stored_day:
+        stored_day = infer_daily_pnl_date_from_state(state)
+        state["daily_pnl_date_utc"] = stored_day
+
+    if stored_day == today:
+        return False
+
+    previous_daily_pnl = float(state.get("daily_pnl", 0.0))
+    history = state.setdefault("daily_pnl_history", {})
+    history[stored_day] = {
+        "pnl": previous_daily_pnl,
+        "rolled_at": utc_now(),
+        "total_pnl_at_roll": float(state.get("total_pnl", 0.0)),
+    }
+
+    state["daily_pnl"] = 0.0
+    state["daily_pnl_date_utc"] = today
+
+    print(
+        f"[BTC5M] daily PnL reset for new UTC day. "
+        f"previous_day={stored_day} previous_daily_pnl={previous_daily_pnl:.4f}"
+    )
+
+    return True
+
+
 def load_state() -> dict[str, Any]:
     if not os.path.exists(STATE_FILE):
         return {
@@ -57,6 +103,8 @@ def load_state() -> dict[str, Any]:
             "live_reconciliation": {},
             "entry_confirmation_candidates": {},
             "daily_pnl": 0.0,
+            "daily_pnl_date_utc": utc_today(),
+            "daily_pnl_history": {},
             "total_pnl": 0.0,
             "last_market_id": None,
             "last_updated": None,
@@ -73,6 +121,8 @@ def load_state() -> dict[str, Any]:
     state.setdefault("live_reconciliation", {})
     state.setdefault("entry_confirmation_candidates", {})
     state.setdefault("daily_pnl", 0.0)
+    state.setdefault("daily_pnl_date_utc", None)
+    state.setdefault("daily_pnl_history", {})
     state.setdefault("total_pnl", 0.0)
     state.setdefault("last_market_id", None)
     state.setdefault("last_updated", None)
@@ -81,8 +131,15 @@ def load_state() -> dict[str, Any]:
 
 def save_state(state: dict[str, Any]) -> None:
     state["last_updated"] = utc_now()
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+
+    tmp_file = f"{STATE_FILE}.tmp"
+    with open(tmp_file, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.replace(tmp_file, STATE_FILE)
 
 
 
@@ -283,6 +340,7 @@ def print_startup_config() -> None:
         "BTC_5M_NO_TRADE_LAST_SECONDS",
         "BTC_5M_MAX_SECONDS_TO_EXPIRY",
         "BTC_5M_REQUIRE_MOMENTUM_CONFIRMATION",
+        "BTC_5M_ORDER_SIZE",
         "BTC_5M_LIVE_ORDER_SIZE",
         "BTC_5M_MIN_LIVE_SHARE_SIZE",
         "BTC_5M_MIN_LIVE_ORDER_VALUE",
@@ -329,12 +387,23 @@ def print_startup_config() -> None:
         "BTC_5M_ORDER_STATUS_POLL_SECONDS",
         "BTC_5M_MIN_FILLED_SIZE",
         "BTC_5M_CANCEL_STALE_ORDERS",
+        "BTC_5M_USE_DYNAMIC_FEE_BUFFER",
+        "BTC_5M_TAKER_FEE_RATE",
+        "BTC_5M_EXTRA_FEE_BUFFER",
+        "BTC_5M_ENABLE_ENTRY_CONFIRMATION",
+        "BTC_5M_ENTRY_CONFIRMATION_REQUIRED",
+        "BTC_5M_ENTRY_CONFIRMATION_MAX_AGE_SECONDS",
+        "BTC_5M_ENTRY_CONFIRMATION_REQUIRE_SAME_REASON",
         "BTC_5M_DISCORD_ALERTS",
+        "BTC_5M_DISCORD_WEBHOOK_URL_SET",
     ]
 
     print("[BTC5M] active config:")
     for key in keys:
-        print(f"[BTC5M]   {key}={os.getenv(key)}")
+        if key == "BTC_5M_DISCORD_WEBHOOK_URL_SET":
+            print(f"[BTC5M]   {key}={bool(os.getenv('BTC_5M_DISCORD_WEBHOOK_URL'))}")
+        else:
+            print(f"[BTC5M]   {key}={os.getenv(key)}")
 
 
 def live_mode_is_armed() -> bool:
@@ -523,6 +592,25 @@ def is_zero_token_balance_error(error_text: str) -> bool:
         "not enough balance / allowance" in text
         or "balance is not enough" in text
         or "balance: 0" in text
+    )
+
+
+def is_geoblocked_trading_error(error_text: str) -> bool:
+    text = str(error_text).lower()
+    return (
+        "status_code=403" in text
+        or "status=403" in text
+        or "trading restricted in your region" in text
+        or "geoblock" in text
+    )
+
+
+def is_clob_service_not_ready_error(error_text: str) -> bool:
+    text = str(error_text).lower()
+    return (
+        "status_code=425" in text
+        or "status=425" in text
+        or "service not ready" in text
     )
 
 
@@ -1082,6 +1170,9 @@ def reconcile_buy_fill_with_token_balance(
 def live_daily_loss_exceeded(state: dict[str, Any]) -> bool:
     if os.getenv("BTC_5M_MODE", "paper").lower() != "live":
         return False
+
+    reset_daily_pnl_if_needed(state)
+
     max_daily_loss = float(os.getenv("BTC_5M_MAX_DAILY_LIVE_LOSS", "1.00"))
     daily_pnl = float(state.get("daily_pnl", 0.0))
     return daily_pnl <= -abs(max_daily_loss)
@@ -1240,12 +1331,13 @@ def reconcile_live_state_on_startup(state: dict[str, Any]) -> dict[str, Any]:
             continue
         try:
             token_info = read_conditional_balance_allowance(client, str(token_id))
+            normalized_token_balance = normalize_conditional_token_balance(float(token_info["balance"]))
             position["startup_token_balance_raw"] = str(token_info["raw"])
-            position["startup_token_balance"] = token_info["balance"]
+            position["startup_token_balance"] = normalized_token_balance
             position["startup_token_allowance"] = token_info["allowance"]
             print(
                 f"[BTC5M] token check market={market_id} "
-                f"balance={token_info['balance']} allowance={token_info['allowance']}"
+                f"balance={normalized_token_balance} allowance={token_info['allowance']} raw_balance={token_info['balance']}"
             )
         except Exception as e:
             position["startup_token_balance_error"] = str(e)
@@ -1321,6 +1413,19 @@ def place_live_limit_buy(snapshot: dict[str, Any], decision: Any) -> dict[str, A
             order_type=V2OrderType.GTC,
         )
     except Exception as e:
+        error_text = str(e)
+
+        if is_geoblocked_trading_error(error_text):
+            raise LiveOrderPreCheckBlocked(
+                f"Live BUY blocked by Polymarket geoblock / region restriction: {error_text}"
+            )
+
+        if is_clob_service_not_ready_error(error_text):
+            raise LiveOrderPreCheckBlocked(
+                f"Live BUY blocked because CLOB service was not ready; no order should be assumed. "
+                f"error={error_text}"
+            )
+
         return reconcile_buy_after_post_exception(
             client=client,
             snapshot=snapshot,
@@ -2510,6 +2615,7 @@ def main() -> None:
 
     ensure_csv_headers()
     state = load_state()
+    reset_daily_pnl_if_needed(state)
     state["mode"] = mode
     state = reconcile_live_state_on_startup(state)
     save_state(state)
@@ -2531,6 +2637,9 @@ def main() -> None:
 
     while True:
         try:
+            if reset_daily_pnl_if_needed(state):
+                save_state(state)
+
             settle_expired_positions(state)
             save_state(state)
 
@@ -2706,6 +2815,7 @@ def main() -> None:
                     )
                 except Exception as e:
                     error_text = str(e)
+                    clear_entry_confirmation_for_market(state, str(snapshot.get("market_id", "")))
                     print(f"[BTC5M] LIVE ORDER BLOCKED/FAILED: {error_text}")
 
                     if isinstance(e, LiveOrderUnfilledCancelled):
