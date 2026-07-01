@@ -49,12 +49,29 @@ def utc_today() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
+def parse_utc_datetime(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    return parsed.astimezone(timezone.utc)
+
+
 def infer_daily_pnl_date_from_state(state: dict[str, Any]) -> str:
     last_updated = state.get("last_updated")
 
     if isinstance(last_updated, str) and last_updated:
         try:
-            return datetime.fromisoformat(last_updated.replace("Z", "+00:00")).date().isoformat()
+            parsed = parse_utc_datetime(last_updated)
+            if parsed is not None:
+                return parsed.date().isoformat()
         except Exception:
             pass
 
@@ -260,9 +277,70 @@ def entry_signal_confirmed(state: dict[str, Any], snapshot: dict[str, Any], deci
     )
     return False
 
+
+def same_market_stoploss_reentry_block(
+    closed_markets: dict[str, Any],
+    market_id: str,
+) -> tuple[bool, str]:
+    if os.getenv("BTC_5M_BLOCK_REENTRY_AFTER_STOPLOSS", "false").lower() != "true":
+        return False, ""
+
+    closed_market = closed_markets.get(market_id)
+    if not isinstance(closed_market, dict):
+        return False, ""
+
+    close_reason = str(closed_market.get("reason", "")).lower()
+    trade_action = str(closed_market.get("trade_action", "")).upper()
+    is_stoploss = close_reason in {"stop_loss", "hard_stop_loss"} or trade_action == "STOPLOSS"
+    if not is_stoploss:
+        return False, ""
+
+    cooldown_seconds = max(
+        0.0,
+        float(os.getenv("BTC_5M_STOPLOSS_REENTRY_COOLDOWN_SECONDS", "300")),
+    )
+    if cooldown_seconds <= 0:
+        return True, "same_market_stoploss_reentry_blocked cooldown=always"
+
+    closed_at = parse_utc_datetime(closed_market.get("timestamp"))
+    if closed_at is None:
+        return True, "same_market_stoploss_reentry_blocked missing_stoploss_timestamp"
+
+    elapsed_seconds = (datetime.now(timezone.utc) - closed_at).total_seconds()
+    if elapsed_seconds >= cooldown_seconds:
+        return False, ""
+
+    remaining_seconds = max(0.0, cooldown_seconds - elapsed_seconds)
+    return (
+        True,
+        f"same_market_stoploss_reentry_blocked cooldown_remaining={remaining_seconds:.1f}s",
+    )
+
+
 def log_decision(row: list[Any]) -> None:
     with open(DECISIONS_FILE, "a", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow(row)
+
+
+def log_blocked_decision(snapshot: dict[str, Any], decision: Any, reason: str) -> None:
+    log_decision([
+        utc_now(),
+        snapshot["market_id"],
+        snapshot["question"],
+        snapshot["btc_price"],
+        snapshot["strike"],
+        snapshot["seconds_to_expiry"],
+        snapshot["yes_bid"],
+        snapshot["yes_ask"],
+        snapshot["no_bid"],
+        snapshot["no_ask"],
+        decision.model_probability,
+        decision.market_probability,
+        decision.edge,
+        "SKIP",
+        reason,
+    ])
+
 
 def ensure_csv_headers() -> None:
     if not os.path.exists(DECISIONS_FILE) or os.path.getsize(DECISIONS_FILE) == 0:
@@ -377,6 +455,8 @@ def print_startup_config() -> None:
         "BTC_5M_TRAIL_MIN_SECONDS_TO_EXPIRY",
         "BTC_5M_TRAIL_FORCE_CASHOUT_NET",
         "BTC_5M_PREVENT_REENTRY_AFTER_CASHOUT",
+        "BTC_5M_BLOCK_REENTRY_AFTER_STOPLOSS",
+        "BTC_5M_STOPLOSS_REENTRY_COOLDOWN_SECONDS",
         "BTC_5M_RECONCILE_ON_STARTUP",
         "BTC_5M_POST_TIMEOUT_RECONCILE_ATTEMPTS",
         "BTC_5M_POST_TIMEOUT_RECONCILE_SLEEP_SECONDS",
@@ -2705,6 +2785,18 @@ def main() -> None:
             # Uncertain live failures are always blocked for the rest of that market.
             if market_id in live_failed_orders:
                 print(f"[BTC5M] market {market_id} has uncertain live failure, skipping")
+                save_state(state)
+                time.sleep(loop_seconds)
+                continue
+
+            stoploss_blocked, stoploss_block_reason = same_market_stoploss_reentry_block(
+                closed_markets,
+                market_id,
+            )
+            if stoploss_blocked:
+                clear_entry_confirmation_for_market(state, str(market_id))
+                log_blocked_decision(snapshot, decision, "same_market_stoploss_reentry_blocked")
+                print(f"[BTC5M] {stoploss_block_reason} market={market_id}")
                 save_state(state)
                 time.sleep(loop_seconds)
                 continue

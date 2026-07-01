@@ -18,6 +18,13 @@ btc_5m_decisions.csv
 *.log
 *.txt
 
+# offline research outputs
+reports/
+models/
+trade_quality_*.csv
+tradingagents_daily_review.json
+phase11_readiness_report.json
+
 # backups / diagnostics / archives
 *.zip
 run_archive/

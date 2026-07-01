@@ -111,6 +111,39 @@ py-clob-client-v2
 
 Even in paper mode, `py-clob-client-v2` should be installed because the bot imports it at startup.
 
+Optional offline ML research packages:
+
+```text
+lightgbm
+xgboost
+```
+
+These are only needed for `train_lightgbm_trade_quality.py` and `train_xgboost_trade_quality.py`. The live bot does not require them, and the ML scripts are diagnostic/offline only.
+
+Foundation-model diagnostics are also offline-only in this repo. `kronos_adapter.py`, `timesfm_adapter.py`, and `chronos_adapter.py` write diagnostic columns such as direction, confidence, expected move, and agreement with the trade, but they do not place orders or block live trades.
+
+`combine_diagnostics.py` joins the offline ML, Kronos, TimesFM, and Chronos diagnostic CSVs into one research table for review. It is diagnostic-only and does not affect the live bot.
+
+`research_darts_forecasts.py` and `research_neuralforecast_forecasts.py` are offline research scripts. They produce local naive benchmark reports when the optional forecasting packages are not installed, and they do not run inside the live trading loop.
+
+`tradingagents_daily_review.py` writes a bounded daily review JSON with a local heuristic fallback when TradingAgents is not installed. It only reads logs and redacted config fields; it does not edit `.env`, edit state, place orders, or affect live execution.
+
+To regenerate the offline research artifacts in order:
+
+```bash
+python run_research_pipeline.py --skip-training
+```
+
+Omit `--skip-training` once enough labeled rows exist and the optional ML packages are installed.
+
+Before any bounded Phase 11 live-regime consumption, run:
+
+```bash
+python phase11_readiness_check.py
+```
+
+If it reports blockers, keep the live bot ignoring all AI/ML review outputs.
+
 ---
 
 ## Installation
