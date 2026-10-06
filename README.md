@@ -1,5 +1,18 @@
 # PolyBTC BTC 5-Minute Polymarket Bot
 
+> [!WARNING]
+> ## Archived Implementation
+>
+> This repository is preserved as a historical version of **PolyBTC**.
+>
+> It is not the current production implementation and is not intended for live deployment.
+>
+> This version still relies on the older **Binance-based BTC reference-price logic**. The Polymarket system was later migrated to the **Chainlink BTC reference stream** .
+>
+> Because of that migration, the pricing, strike, momentum, settlement, and strategy behavior in this repository no longer match the live system.
+>
+> The code is intentionally left unchanged for project preservation. The current production implementation is not published in this repository.
+
 A Python trading bot for BTC 5-minute up/down prediction markets on Polymarket.
 
 The bot watches active BTC 5-minute markets, reads BTC price data and Polymarket order books, calculates a directional edge, and can run in either **paper mode** or **live mode**.
